@@ -7,7 +7,7 @@ from pathlib import Path
 
 from harness.paths import state_dir
 
-EVENTS = ("task.new", "dispatch.start", "dispatch.end", "gate", "merge")
+EVENTS = ("task.new", "dispatch.start", "dispatch.end", "review.start", "review.end", "gate", "merge")
 
 
 def append(root: Path, event: str, **fields) -> dict:

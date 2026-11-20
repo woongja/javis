@@ -31,6 +31,41 @@ def test_merge_happy(gated_task, monkeypatch):
     assert load(root, task_id).status == "merged"
 
 
+def test_merge_allows_unrelated_main_change(gated_task):
+    root, task_id = gated_task
+    (root / "README.md").write_text("main change\n", encoding="utf-8")
+    run(["git", "add", "README.md"], root)
+    run(["git", "commit", "-qm", "unrelated change"], root)
+
+    _, warnings = merge(root, task_id)
+
+    assert warnings == []
+    assert (root / "README.md").read_text(encoding="utf-8") == "main change\n"
+    assert (root / "hud" / "demo.txt").exists()
+
+
+@pytest.mark.parametrize("filename", ["demo.txt", "DEMO.TXT"], ids=["same-path", "windows-case"])
+def test_merge_rejects_overlapping_main_change(gated_task, monkeypatch, filename):
+    root, task_id = gated_task
+    wt = worktree_dir(root, task_id)
+    base = run(["git", "rev-parse", "--short=7", "HEAD"], wt).strip()
+    (root / "hud").mkdir()
+    (root / "hud" / filename).write_text("main change\n", encoding="utf-8")
+    run(["git", "add", "hud"], root)
+    run(["git", "commit", "-qm", "overlapping change"], root)
+    main_head = run(["git", "rev-parse", "HEAD"], root)
+    if filename == "DEMO.TXT":
+        monkeypatch.setattr(merge_module.platform, "is_windows", lambda: True)
+
+    with pytest.raises(HarnessError) as error:
+        merge(root, task_id)
+
+    assert str(error.value) == f"main moved since {base} and also changed: hud/demo.txt; re-gate needed"
+    assert run(["git", "rev-parse", "HEAD"], root) == main_head
+    assert run(["git", "rev-parse", "HEAD"], wt).startswith(base)
+    assert load(root, task_id).status == "gated"
+
+
 def test_merge_cli_continues_cleanup_after_worktree_removal_fails(gated_task, monkeypatch, tmp_path, capsys):
     root, task_id = gated_task
     task = load(root, task_id)

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from harness import HarnessError, ledger
+from harness import HarnessError, ledger, platform
 from harness.paths import env_path, handoff_dir, repo_root, worktree_dir
 from harness.tasks import load, save
 
@@ -35,6 +35,17 @@ def _check_preconditions(root: Path, task_id: str) -> Path:
         raise HarnessError(f"main not checked out in {root}")
     if _git(root, "status", "--porcelain").strip():
         raise HarnessError("main not clean; commit or stash your own changes first")
+    base = _git(wt, "rev-parse", "HEAD").strip()
+    main = _git(root, "rev-parse", "HEAD").strip()
+    if main != base:
+        diff = ("diff", "--name-only", "--no-renames", "--ignore-submodules=none", "--no-relative", "-z")
+        task_files = _git(wt, *diff, base, task.gate_tree).strip("\0").split("\0")
+        main_files = _git(root, *diff, base, main).strip("\0").split("\0")
+        normalize = str.lower if platform.is_windows() else str
+        changed = {normalize(path) for path in main_files if path}
+        overlap = [path for path in task_files if normalize(path) in changed]
+        if overlap:
+            raise HarnessError(f"main moved since {base[:7]} and also changed: {', '.join(overlap[:5])}; re-gate needed")
     return wt
 
 
