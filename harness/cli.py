@@ -8,7 +8,7 @@ from collections.abc import Callable
 from harness import HarnessError, __version__
 
 # Each command module exposes register(subparsers) and sets args.func.
-_REGISTRARS: list[str] = ["hooks", "tasks", "dispatch"]
+_REGISTRARS: list[str] = ["hooks", "tasks", "dispatch", "gate"]
 
 
 def _build_parser() -> argparse.ArgumentParser:
