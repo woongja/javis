@@ -1,4 +1,8 @@
-"""`harness gate <id>`: machine-check a task's completion criteria."""
+"""`harness gate <id>`: machine-check a task's completion criteria.
+
+R3  staged changes must stay within the task's allowed paths.
+    why: out-of-spec changes can slip in without review. expires: never.
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,10 +19,13 @@ from pathlib import Path
 from harness import HarnessError, ledger, platform
 from harness.guards import added_lines, scan_text
 from harness.paths import handoff_dir, repo_root, worktree_dir
+from harness.roles import load_ownership
 from harness.runner import safe_env
 from harness.tasks import load, save
 
 _BLOCK = re.compile(r"```gate[ \t]*\n(.*?)```", re.S)
+_SCOPE = re.compile(r"^## 건드릴 경로[ \t]*\n(.*?)(?=^## |\Z)", re.M | re.S)
+_PATH_TOKEN = re.compile(r"(?<!`)(`+)([^`\n]+)\1(?!`)")
 
 
 @dataclass
@@ -69,6 +76,30 @@ def _r7_check(wt: Path) -> dict | None:
     return {"cmd": "R7 scan: " + "; ".join(f.snippet for f in findings[:5]), "exit": 1, "duration_s": 0}
 
 
+def _r3_check(wt: Path, spec: str, owner: str) -> dict | None:
+    def normalize(path: str) -> str:
+        return path.lower() if platform.is_windows() else path
+
+    section = _SCOPE.search(spec)
+    tokens = _PATH_TOKEN.findall(section.group(1)) if section else []
+    paths = [normalize(token.replace("\\", "/")) for _, token in tokens]
+    files = {path for path in paths if not path.endswith("/")}
+    prefixes = tuple(path for path in paths if path.endswith("/"))
+    if not paths:
+        prefixes = tuple(normalize(path.replace("\\", "/")) for path in load_ownership().get(owner, []))
+
+    # Disabling rename detection lists the source deletion and destination addition separately.
+    changed = _git(wt, "diff", "--cached", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", "HEAD")
+    outside = []
+    for path in changed.split("\0"):
+        normalized = normalize(path)
+        if path and normalized not in files and not normalized.startswith(prefixes):
+            outside.append(path)
+    if outside:
+        return {"cmd": "R3 scope: " + "; ".join(outside[:5]), "exit": 1, "duration_s": 0}
+    return None
+
+
 def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     task = load(root, task_id)
     wt = worktree_dir(root, task_id)
@@ -77,12 +108,16 @@ def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     # Invalidate any earlier approval first, so a crash mid-gate never leaves a stale pass.
     task.status, task.gate_tree = ("done" if task.status == "gated" else task.status), None
     save(root, task)
-    commands = parse_gate_commands((handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8"))
+    spec = (handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8")
+    commands = parse_gate_commands(spec)
     env = safe_env(os.environ, {})
     results = [_run_one(argv, wt, env, timeout_s) for argv in commands]
     r7 = _r7_check(wt)
     if r7:
         results.append(r7)
+    r3 = _r3_check(wt, spec, task.owner)
+    if r3:
+        results.append(r3)
     tree = _git(wt, "write-tree").strip()
     passed = bool(commands) and all(r["exit"] == 0 for r in results)
     result = GateResult(passed, results, tree)

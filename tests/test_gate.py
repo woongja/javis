@@ -1,6 +1,8 @@
 import json
 import sys
 
+import pytest
+
 from harness.cli import main
 from harness.gate import parse_gate_commands, run_gate
 from harness.paths import handoff_dir, worktree_dir
@@ -50,6 +52,53 @@ def test_gate_blocks_r7(dispatched_task):
     (worktree_dir(root, task_id) / "hud" / "note.md").write_text("see /Users/bob/x\n", encoding="utf-8")  # harness:allow
     result = run_gate(root, task_id)
     assert not result.passed and any("R7" in r["cmd"] for r in result.results)
+
+
+def test_gate_checks_scope_from_spec(dispatched_task):
+    set_gate(*dispatched_task, [HUD_EXISTS])
+    spec = handoff_dir(*dispatched_task) / "spec.md"
+    gate_file, test_dir = (r"HARNESS\GATE.PY", "TESTS/") if sys.platform == "win32" else (r"harness\gate.py", "tests/")
+    spec.write_text(spec.read_text(encoding="utf-8").replace(
+        "## 건드릴 경로\n", f"## 건드릴 경로\n- `{gate_file}`, `{test_dir}`, `hud/` (설명)\n"
+    ) + "\n## Other paths\n- `harness/gate.py.bak`\n", encoding="utf-8")
+    wt = worktree_dir(*dispatched_task)
+    for path in (wt / "harness/gate.py", wt / "tests/sub/범위 확인.txt"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("scope fixture\n", encoding="utf-8")
+    assert run_gate(*dispatched_task).passed
+
+    (wt / "harness/gate.py.bak").write_text("outside scope\n", encoding="utf-8")
+    result = run_gate(*dispatched_task)
+    assert not result.passed
+    assert result.results[-1] == {"cmd": "R3 scope: harness/gate.py.bak", "exit": 1, "duration_s": 0}
+    saved = json.loads((handoff_dir(*dispatched_task) / "gate.json").read_text(encoding="utf-8"))
+    assert saved["results"] == result.results
+
+
+@pytest.mark.parametrize("section", ["", "## 건드릴 경로\n- 설명만 있음\n"])
+def test_gate_falls_back_to_task_ownership(dispatched_task, section):
+    set_gate(*dispatched_task, [HUD_EXISTS])
+    spec = handoff_dir(*dispatched_task) / "spec.md"
+    spec.write_text(spec.read_text(encoding="utf-8").replace("## 건드릴 경로\n", section), encoding="utf-8")
+    assert run_gate(*dispatched_task).passed
+
+    wt = worktree_dir(*dispatched_task)
+    (wt / "README.md").write_text("modified outside scope\n", encoding="utf-8")
+    result = run_gate(*dispatched_task)
+    assert not result.passed and result.results[-1]["cmd"] == "R3 scope: README.md"
+
+
+@pytest.mark.parametrize("allowed, outside", [("README.md", "hud/moved.md"), ("hud/", "README.md")])
+def test_gate_checks_both_ends_of_rename(dispatched_task, allowed, outside):
+    set_gate(*dispatched_task, [HUD_EXISTS])
+    spec = handoff_dir(*dispatched_task) / "spec.md"
+    spec.write_text(spec.read_text(encoding="utf-8").replace(
+        "## 건드릴 경로\n", f"## 건드릴 경로\n- `hud/demo.txt`, `{allowed}`\n"
+    ), encoding="utf-8")
+    wt = worktree_dir(*dispatched_task)
+    (wt / "README.md").rename(wt / "hud/moved.md")
+    result = run_gate(*dispatched_task)
+    assert not result.passed and result.results[-1]["cmd"] == f"R3 scope: {outside}"
 
 
 def test_cli_gate_exit_code(dispatched_task, monkeypatch):

@@ -57,9 +57,13 @@ def lead_candidates(path: Path | None = None) -> list[Role]:
     return [_make_role("lead", c) for c in _read(path).get("lead", {}).get("candidates", [])]
 
 
+def load_ownership(path: Path | None = None) -> dict[str, list[str]]:
+    return _read(path).get("ownership", {})
+
+
 def owner_of(rel_path: str, path: Path | None = None) -> Tool | None:
     normalized = rel_path.replace("\\", "/")
-    for team, prefixes in _read(path).get("ownership", {}).items():
+    for team, prefixes in load_ownership(path).items():
         if any(normalized.startswith(p) for p in prefixes):
             return team
     return None
