@@ -15,6 +15,7 @@ from harness.paths import repo_root
 _FILE_TOOLS = {"Read": "read", "Write": "write", "Edit": "write", "MultiEdit": "write", "NotebookEdit": "write"}
 _PATH_FIELDS = ("file_path", "notebook_path")
 _SEARCH_TOOLS = {"Grep", "Glob"}
+_SHELL_TOOLS = {"Bash", "PowerShell"}
 
 
 def claude_pre(payload: dict, ctx: GuardContext) -> tuple[int, str]:
@@ -24,7 +25,7 @@ def claude_pre(payload: dict, ctx: GuardContext) -> tuple[int, str]:
     target = next((data[f] for f in _PATH_FIELDS if data.get(f)), None)
     if tool in _FILE_TOOLS and target:
         verdict = check_path(Path(target), _FILE_TOOLS[tool], ctx)
-    elif tool == "Bash" and data.get("command"):
+    elif tool in _SHELL_TOOLS and data.get("command"):
         verdict = check_command(data["command"], ctx)
     elif tool in _SEARCH_TOOLS and data.get("path"):
         verdict = check_path(Path(data["path"]), "read", ctx)

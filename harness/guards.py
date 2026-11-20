@@ -2,6 +2,7 @@
 
 R1  secrets / brain / tool homes: no read, no write.
     why: credentials and the private brain must never reach a dev agent. expires: never.
+    exception: the lead session (no worktree) may use ~/.claude/projects/*/memory/.
 R2  a dispatched worker writes only inside its own worktree.
     why: teams run side by side; stray writes collide. expires: never.
 R4  raw git commit/push/merge/rebase/reset --hard/--no-verify are blocked; use `harness merge`.
@@ -71,11 +72,19 @@ def _absolute(path: Path, ctx: GuardContext) -> Path:
     return (ctx.worktree or ctx.repo) / path
 
 
+def _is_agent_memory(target: Path, home: Path) -> bool:
+    """~/.claude/projects/<project>/memory/** (Claude Code auto-memory)."""
+    rel, base = _key(target), _key(home / ".claude" / "projects")
+    return rel[: len(base)] == base and len(rel) > len(base) + 2 and rel[len(base) + 1] == "memory"
+
+
 def check_path(path: Path, op: Literal["read", "write"], ctx: GuardContext) -> Verdict:
     target = _absolute(Path(path), ctx)
     name = target.name.casefold()
     if (name == ".env" or name.startswith(".env.")) and name != ".env.example":
         return Verdict(False, "R1", f"{target.name} holds secrets")
+    if ctx.worktree is None and _is_agent_memory(target, ctx.home):
+        return _OK  # the lead session keeps its own notes; workers (worktree set) never do
     protected = [(ctx.home / d, f"~/{d}") for d in (".claude", ".codex", ".ssh")]
     for root in filter(None, (ctx.repo, ctx.worktree)):
         protected.append((root / "secrets", "secrets/"))

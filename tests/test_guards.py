@@ -111,3 +111,12 @@ def test_scan_detects(text):
 
 def test_scan_clean_text():
     assert scan_text("def f(x):\n    return x  # no secrets here\n") == []
+
+
+def test_lead_may_use_agent_memory_but_not_rest_of_claude_home(ctx, worker_ctx):
+    mem = ctx.home / ".claude" / "projects" / "any-project" / "memory" / "note.md"
+    assert check_path(mem, "write", ctx).allowed
+    assert check_path(mem, "read", ctx).allowed
+    assert not check_path(ctx.home / ".claude" / "settings.json", "write", ctx).allowed
+    assert not check_path(ctx.home / ".claude" / "projects" / "p" / "session.jsonl", "read", ctx).allowed
+    assert not check_path(mem, "read", worker_ctx).allowed  # workers never see memory

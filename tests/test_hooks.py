@@ -77,3 +77,7 @@ def test_cli_scan_all(git_repo, monkeypatch, capsys):
     run(["git", "add", "leak.txt"], git_repo)
     assert main(["hook", "scan-all"]) == 1
     assert "leak.txt" in capsys.readouterr().out
+
+
+def test_claude_pre_blocks_git_commit_via_powershell(ctx):
+    assert claude_pre({"tool_name": "PowerShell", "tool_input": {"command": "git commit -m x"}}, ctx)[0] == 2
