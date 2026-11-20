@@ -4,7 +4,7 @@ import sys
 import pytest
 
 from harness.cli import main
-from harness.gate import parse_gate_commands, run_gate
+from harness.gate import _r3_check, parse_gate_commands, run_gate
 from harness.paths import handoff_dir, worktree_dir
 from harness.tasks import load
 from tests.conftest import HUD_EXISTS, set_gate
@@ -59,24 +59,27 @@ def test_gate_checks_scope_from_spec(dispatched_task):
     spec = handoff_dir(*dispatched_task) / "spec.md"
     gate_file, test_dir = (r"HARNESS\GATE.PY", "TESTS/") if sys.platform == "win32" else (r"harness\gate.py", "tests/")
     spec.write_text(spec.read_text(encoding="utf-8").replace(
-        "## 건드릴 경로\n", f"## 건드릴 경로\n- `{gate_file}`, `{test_dir}`, `hud/` (설명)\n"
+        "## 건드릴 경로\n", f"## 건드릴 경로 (설명)\n- `{gate_file}`, `{test_dir}`, `hud/` (설명)\n"
     ) + "\n## Other paths\n- `harness/gate.py.bak`\n", encoding="utf-8")
     wt = worktree_dir(*dispatched_task)
     for path in (wt / "harness/gate.py", wt / "tests/sub/범위 확인.txt"):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("scope fixture\n", encoding="utf-8")
-    assert run_gate(*dispatched_task).passed
+    assert _r3_check(wt, spec.read_text(encoding="utf-8"), "codex") is None
 
     (wt / "harness/gate.py.bak").write_text("outside scope\n", encoding="utf-8")
+    scope_failure = {"cmd": "R3 scope: harness/gate.py.bak", "exit": 1, "duration_s": 0}
+    assert _r3_check(wt, spec.read_text(encoding="utf-8"), "codex") == scope_failure
     result = run_gate(*dispatched_task)
     assert not result.passed
-    assert result.results[-1] == {"cmd": "R3 scope: harness/gate.py.bak", "exit": 1, "duration_s": 0}
+    assert scope_failure in result.results
     saved = json.loads((handoff_dir(*dispatched_task) / "gate.json").read_text(encoding="utf-8"))
     assert saved["results"] == result.results
 
 
 @pytest.mark.parametrize("section", ["", "## 건드릴 경로\n- 설명만 있음\n"])
-def test_gate_falls_back_to_task_ownership(dispatched_task, section):
+def test_gate_falls_back_to_task_ownership(dispatched_task, section, monkeypatch):
+    monkeypatch.setattr("harness.gate.load_ownership", lambda: {"codex": ["hud/", ""]})
     set_gate(*dispatched_task, [HUD_EXISTS])
     spec = handoff_dir(*dispatched_task) / "spec.md"
     spec.write_text(spec.read_text(encoding="utf-8").replace("## 건드릴 경로\n", section), encoding="utf-8")

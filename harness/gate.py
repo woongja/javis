@@ -19,13 +19,16 @@ from pathlib import Path
 from harness import HarnessError, ledger, platform
 from harness.guards import added_lines, scan_text
 from harness.paths import handoff_dir, repo_root, worktree_dir
+from harness.review import opposite_team, verdict
 from harness.roles import load_ownership
-from harness.runner import safe_env
+from harness.runner import git as _git, safe_env
 from harness.tasks import load, save
 
 _BLOCK = re.compile(r"```gate[ \t]*\n(.*?)```", re.S)
-_SCOPE = re.compile(r"^## 건드릴 경로[ \t]*\n(.*?)(?=^## |\Z)", re.M | re.S)
+_SCOPE = re.compile(r"^##[ \t]*건드릴 경로[^\n]*\n(.*?)(?=^## |\Z)", re.M | re.S)
 _PATH_TOKEN = re.compile(r"(?<!`)(`+)([^`\n]+)\1(?!`)")
+_DIFF_SCOPE = ("--no-renames", "--ignore-submodules=none", "--no-relative", "-z")
+_REVIEW_PREFIXES = ("harness/", "security/", ".githooks/", ".github/", ".claude/")
 
 
 @dataclass
@@ -51,11 +54,6 @@ def _split(line: str) -> list[str]:
             for t in shlex.split(line, posix=False)]
 
 
-def _git(wt: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=wt, check=True, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace").stdout
-
-
 def _run_one(argv: list[str], wt: Path, env: dict, timeout_s: int) -> dict:
     exe = shutil.which(argv[0], path=env.get("PATH")) or argv[0]
     started = time.monotonic()
@@ -77,6 +75,8 @@ def _r7_check(wt: Path) -> dict | None:
 
 
 def _r3_check(wt: Path, spec: str, owner: str) -> dict | None:
+    _git(wt, "add", "-A")
+
     def normalize(path: str) -> str:
         return path.lower() if platform.is_windows() else path
 
@@ -86,10 +86,10 @@ def _r3_check(wt: Path, spec: str, owner: str) -> dict | None:
     files = {path for path in paths if not path.endswith("/")}
     prefixes = tuple(path for path in paths if path.endswith("/"))
     if not paths:
-        prefixes = tuple(normalize(path.replace("\\", "/")) for path in load_ownership().get(owner, []))
+        prefixes = tuple(normalize(path.replace("\\", "/")) for path in load_ownership().get(owner, []) if path)
 
     # Disabling rename detection lists the source deletion and destination addition separately.
-    changed = _git(wt, "diff", "--cached", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", "HEAD")
+    changed = _git(wt, "diff", "--cached", "--name-only", *_DIFF_SCOPE, "HEAD")
     outside = []
     for path in changed.split("\0"):
         normalized = normalize(path)
@@ -100,6 +100,31 @@ def _r3_check(wt: Path, spec: str, owner: str) -> dict | None:
     return None
 
 
+def _requires_review(wt: Path, tree: str) -> bool:
+    stats = _git(wt, "diff", "--numstat", "--no-ext-diff", "--no-textconv", *_DIFF_SCOPE, "HEAD", tree)
+    total = 0
+    windows = platform.is_windows()
+    for entry in filter(None, stats.split("\0")):
+        added, deleted, path = entry.split("\t", 2)
+        if windows:
+            path = path.lower()
+        if path == ("agents.md" if windows else "AGENTS.md") or path.startswith(_REVIEW_PREFIXES):
+            return True
+        total += sum(int(count) for count in (added, deleted) if count != "-")
+    return total >= 50
+
+
+def _review_passed(path: Path, tree: str, owner: str) -> bool:
+    try:
+        header, _, output = path.read_text(encoding="utf-8").partition("\n")
+    except (OSError, UnicodeError):
+        return False
+    role_header, _, output = output.partition("\n")
+    prefix = f"role: {opposite_team(owner)}."
+    return (header == f"tree: {tree}" and role_header.startswith(prefix)
+            and bool(role_header[len(prefix):].strip()) and verdict(output) == "pass")
+
+
 def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     task = load(root, task_id)
     wt = worktree_dir(root, task_id)
@@ -108,7 +133,8 @@ def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     # Invalidate any earlier approval first, so a crash mid-gate never leaves a stale pass.
     task.status, task.gate_tree = ("done" if task.status == "gated" else task.status), None
     save(root, task)
-    spec = (handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8")
+    folder = handoff_dir(root, task_id)
+    spec = (folder / "spec.md").read_text(encoding="utf-8")
     commands = parse_gate_commands(spec)
     env = safe_env(os.environ, {})
     results = [_run_one(argv, wt, env, timeout_s) for argv in commands]
@@ -119,10 +145,11 @@ def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     if r3:
         results.append(r3)
     tree = _git(wt, "write-tree").strip()
+    if _requires_review(wt, tree) and not _review_passed(folder / "review.md", tree, task.owner):
+        results.append({"cmd": f"review required: harness review {task_id}", "exit": 1})
     passed = bool(commands) and all(r["exit"] == 0 for r in results)
     result = GateResult(passed, results, tree)
-    (handoff_dir(root, task_id) / "gate.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2),
-                                                          encoding="utf-8")
+    (folder / "gate.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
     if passed:
         task.status, task.gate_tree = "gated", tree
         save(root, task)
@@ -135,7 +162,7 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     if not result.results:
         print("no gate commands: add lines to the ```gate block in spec.md")
     for r in result.results:
-        print(f"{'✅' if r['exit'] == 0 else '✗'} exit={r['exit']:<4} {r['duration_s']:>6}s  {r['cmd']}")
+        print(f"{'✅' if r['exit'] == 0 else '✗'} exit={r['exit']:<4} {r.get('duration_s', 0):>6}s  {r['cmd']}")
     print("PASSED" if result.passed else "FAILED")
     return 0 if result.passed else 1
 

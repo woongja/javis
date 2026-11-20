@@ -41,6 +41,12 @@ class RunResult:
     duration_s: float
     quota_hit: bool
     timed_out: bool
+    stdout: str = ""
+
+
+def git(wt: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=wt, check=True, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace").stdout
 
 
 def safe_env(environ: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, str]:
@@ -50,15 +56,27 @@ def safe_env(environ: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, 
     return env
 
 
-def build_command(role: Role, worktree: Path, brain: Path | None = None) -> list[str]:
+def build_command(role: Role, worktree: Path, brain: Path | None = None, *, read_only: bool = False) -> list[str]:
     exe = find_exe(role.tool, f"JAVIS_{role.tool.upper()}_BIN")
     if exe is None:
         raise HarnessError(f"{role.tool} not found on PATH (run `harness doctor`)")
     if role.tool == "claude":
-        cmd = [str(exe), "-p", "--model", role.model, "--effort", role.effort,
-               "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
+        cmd = [str(exe), "-p", "--model", role.model, "--effort", role.effort]
+        settings = {}
         if brain is not None:
             settings = {"sandbox": {"enabled": True, "filesystem": {"denyRead": [str(brain)]}}}
+        if read_only:
+            cmd.extend(["--restricted", "--safe-mode", "--strict-mcp-config", "--tools", "Read,Grep,Glob"])
+            deny = ["Read(**/.env)", "Read(**/.env.*)", "Read(**/secrets/**)"]
+            if brain is not None:
+                path = brain.as_posix()
+                if brain.drive.endswith(":"):
+                    path = path[0].lower() + path[2:]  # Claude represents C:/ as /c/.
+                deny.append(f"Read(//{path.lstrip('/')}/**)")
+            settings["permissions"] = {"deny": deny}
+        else:
+            cmd.extend(["--setting-sources", "project,local", "--permission-mode", "acceptEdits"])
+        if settings:
             settings_json = json.dumps(settings)
             if exe.suffix.casefold() in {".cmd", ".bat"}:
                 # Windows npm shims pass the argument through cmd.exe.
@@ -79,7 +97,7 @@ def build_command(role: Role, worktree: Path, brain: Path | None = None) -> list
         hook_toml = re.sub(r"[%!^&|<>()]", lambda m: f"\\u{ord(m[0]):04x}", hook_toml)
     config = f"hooks.PreToolUse=[{{matcher='.*',hooks=[{{type='command',command={hook_toml},timeout=30}}]}}]"
     return [str(exe), "exec", "-m", role.model, "-c", f'model_reasoning_effort="{role.effort}"',
-            "--ignore-user-config", "-C", str(worktree), "-s", "workspace-write",
+            "--ignore-user-config", "-C", str(worktree), "-s", "read-only" if read_only else "workspace-write",
             "--dangerously-bypass-hook-trust", "-c", config,
             *platform.codex_sandbox_args(), "-"]
 
@@ -91,12 +109,15 @@ def run(cmd: list[str], prompt: str, cwd: Path, env: dict[str, str], timeout_s: 
         proc = subprocess.run(cmd, input=prompt, cwd=cwd, env=env, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=timeout_s, shell=False)
     except subprocess.TimeoutExpired as exc:
-        log_path.write_text(f"TIMEOUT after {timeout_s}s\n{exc.stdout or ''}", encoding="utf-8")
-        return RunResult(-1, time.monotonic() - started, False, True)
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        log_path.write_text(f"TIMEOUT after {timeout_s}s\n{stdout}", encoding="utf-8")
+        return RunResult(-1, time.monotonic() - started, False, True, stdout)
     output = f"{proc.stdout}\n--- stderr ---\n{proc.stderr}"
     log_path.write_text(output, encoding="utf-8")
     quota = proc.returncode != 0 and bool(_QUOTA.search(output))
-    return RunResult(proc.returncode, round(time.monotonic() - started, 2), quota, False)
+    return RunResult(proc.returncode, round(time.monotonic() - started, 2), quota, False, proc.stdout)
 
 
 @contextmanager
