@@ -1,9 +1,9 @@
-import os
+import subprocess
 
 import pytest
 
 from harness.cli import main
-from harness.doctor import parse_version, run_checks, select_lead
+from harness.doctor import _brain_isolation, parse_version, run_checks, select_lead
 from tests.conftest import run
 
 
@@ -68,6 +68,7 @@ def test_env_keys_no_values(git_repo, fake_bins, monkeypatch, capsys):
 ])
 def test_brain_dir(git_repo, fake_bins, monkeypatch, capsys, configured, exists, status):
     monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    monkeypatch.setattr("harness.platform.is_windows", lambda: False)
     brain_dir = git_repo / "example-brain-folder"
     if exists:
         brain_dir.mkdir()
@@ -87,6 +88,65 @@ def test_brain_dir(git_repo, fake_bins, monkeypatch, capsys, configured, exists,
     output = capsys.readouterr()
     assert "brain-dir" in output.out
     assert brain_dir.name not in output.out + output.err
+
+
+@pytest.mark.parametrize(("offline_ace", "online_ace", "online_exists", "status"), [
+    ("(DENY)(OI)(CI)(R)", "(OI)(CI)(DENY)(RX)", True, "ok"),
+    ("(OI)(CI)(R)", "(OI)(CI)(R)", True, "fail"),
+    ("(DENY)(OI)(R)", "(DENY)(OI)(CI)(R)", True, "fail"),
+    ("(DENY)(OI)(CI)(IO)(R)", "(DENY)(OI)(CI)(R)", True, "fail"),
+    ("(DENY)(OI)(CI)(NP)(R)", "(DENY)(OI)(CI)(R)", True, "fail"),
+    ("(DENY)(OI)(CI)(W)", "(DENY)(OI)(CI)(R)", True, "fail"),
+    ("(DENY)(OI)(CI)(R)", "(OI)(CI)(R)", False, "ok"),
+])
+def test_windows_brain_isolation(git_repo, fake_bins, monkeypatch, capsys, offline_ace, online_ace,
+                                 online_exists, status):
+    brain = git_repo / "example private folder"
+    brain.mkdir()
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(brain))
+    monkeypatch.setattr("harness.platform.is_windows", lambda: True)
+    native_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "powershell.exe":
+            accounts = "EXAMPLE\\CodexSandboxOffline\tS-1-5-21-1000\n"
+            if online_exists:
+                accounts += "EXAMPLE\\CodexSandboxOnline\tS-1-5-21-1001\n"
+            return subprocess.CompletedProcess(cmd, 0, accounts, "")
+        if cmd[0] == "icacls":
+            assert cmd == ["icacls", str(brain.resolve())]
+            acl = f"{brain} EXAMPLE\\CodexSandboxOffline:{offline_ace}\n"
+            acl += f"    *S-1-5-21-1001:{online_ace}\n"
+            return subprocess.CompletedProcess(cmd, 0, acl, "")
+        return native_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    check = _checks(git_repo)["brain-isolation"]
+    assert check.status == status
+    monkeypatch.chdir(git_repo)
+    assert main(["doctor", "--fix"]) == (1 if status == "fail" else 0)
+    output = capsys.readouterr()
+    assert brain.name not in output.out + output.err
+    if status == "fail":
+        fix = 'icacls "%JAVIS_BRAIN_DIR%" /deny "CodexSandboxOffline:(OI)(CI)R"'
+        if "DENY" not in online_ace:
+            fix += ' "CodexSandboxOnline:(OI)(CI)R"'
+        assert check.fix == fix
+        assert fix in output.out
+
+
+def test_brain_isolation_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    check = _brain_isolation(tmp_path)
+    assert (check.status, check.detail) == ("warn", "not set")
+
+
+def test_brain_isolation_non_windows(tmp_path, monkeypatch):
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", "example brain")
+    monkeypatch.setattr("harness.platform.is_windows", lambda: False)
+    check = _brain_isolation(tmp_path)
+    assert check.status == "ok"
+    assert check.detail == "claude sandbox denyRead applied at dispatch (codex: unverified)"
 
 
 def test_fix_sets_hooks_path(git_repo, fake_bins, monkeypatch):

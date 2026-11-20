@@ -28,16 +28,27 @@ def test_codex_windows_sandbox_arg(fake_bins, tmp_path, monkeypatch):
 
 def test_build_codex_command(fake_bins, tmp_path, monkeypatch):
     monkeypatch.setattr("harness.platform.is_windows", lambda: False)
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "example brain"))
     cmd = build_command(Role("codex.dev", "codex", "gpt-6.2-sol", "medium"), tmp_path)
     assert cmd[0] == str(fake_bins["codex"])
     assert cmd[1:] == ["exec", "-m", "gpt-6.2-sol", "-c", 'model_reasoning_effort="medium"',
                        "--ignore-user-config", "-C", str(tmp_path), "-s", "workspace-write", "-"]
 
 
-def test_build_claude_command(fake_bins, tmp_path):
+def test_build_claude_command(fake_bins, tmp_path, monkeypatch):
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
     cmd = build_command(Role("claude.dev", "claude", "claude-opus-5-5", "medium"), tmp_path)
     assert cmd[1:] == ["-p", "--model", "claude-opus-5-5", "--effort", "medium",
                        "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
+
+
+def test_build_claude_command_with_brain(fake_bins, tmp_path, monkeypatch):
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", "example brain")
+    cmd = build_command(Role("claude.dev", "claude", "claude-opus-5-5", "medium"), tmp_path)
+    assert cmd[-2] == "--settings"
+    assert json.loads(cmd[-1]) == {
+        "sandbox": {"enabled": True, "filesystem": {"denyRead": [str((tmp_path / "example brain").resolve())]}}
+    }
 
 
 def test_build_command_missing_exe(monkeypatch, tmp_path):
@@ -75,7 +86,7 @@ def test_dispatch_passes_worker_env(git_repo_with_harness, fake_bins, monkeypatc
 @pytest.mark.parametrize("brain_in_process_env", [False, True])
 def test_dispatch_passes_brain_dir(git_repo_with_harness, fake_bins, monkeypatch, brain_in_process_env):
     root = git_repo_with_harness
-    dotenv_brain = "../brain from dotenv"
+    dotenv_brain = "../brain from dotenv & %TEMP% (example)"
     (root / ".env").write_text(f"JAVIS_BRAIN_DIR={dotenv_brain}\n", encoding="utf-8")
     if brain_in_process_env:
         brain = "../brain from process env"
@@ -84,13 +95,16 @@ def test_dispatch_passes_brain_dir(git_repo_with_harness, fake_bins, monkeypatch
         brain = dotenv_brain
         monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
 
-    subdir = root / "subdir"
-    subdir.mkdir()
-    monkeypatch.chdir(subdir)
+    caller = root.parent / "caller"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
     task = dispatch(root, new_task(root, "brain guard", "claude").id, "claude.dev")
     wt = worktree_dir(root, task.id)
     assert not (wt / ".env").exists()
-    assert f"brain={(root / brain).resolve()}" in (wt / ".fake-args.txt").read_text(encoding="utf-8").splitlines()
+    args = (wt / ".fake-args.txt").read_text(encoding="utf-8").splitlines()
+    brain_path = str((root / brain).resolve())
+    assert f"brain={brain_path}" in args
+    assert json.loads(args[args.index("--settings") + 1])["sandbox"]["filesystem"]["denyRead"] == [brain_path]
 
 
 def test_dispatch_quota(git_repo_with_harness, fake_bins, monkeypatch):

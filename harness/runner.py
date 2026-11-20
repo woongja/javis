@@ -6,6 +6,7 @@ R5  child processes get an allow-listed environment only.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from harness import HarnessError
-from harness.paths import state_dir
+from harness.paths import env_path, state_dir
 from harness import platform
 from harness.platform import find_exe, pid_alive
 from harness.roles import Role
@@ -52,8 +53,21 @@ def build_command(role: Role, worktree: Path) -> list[str]:
     if exe is None:
         raise HarnessError(f"{role.tool} not found on PATH (run `harness doctor`)")
     if role.tool == "claude":
-        return [str(exe), "-p", "--model", role.model, "--effort", role.effort,
-                "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
+        cmd = [str(exe), "-p", "--model", role.model, "--effort", role.effort,
+               "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
+        # Dispatch reads configuration from the repo that owns <repo>-wt/<task>.
+        root = worktree
+        parent = worktree.parent
+        if parent.name.endswith("-wt") and (worktree / ".git").is_file():
+            root = parent.parent / parent.name.removesuffix("-wt")
+        if brain := env_path(root, "JAVIS_BRAIN_DIR"):
+            settings = {"sandbox": {"enabled": True, "filesystem": {"denyRead": [str(brain)]}}}
+            settings_json = json.dumps(settings)
+            if exe.suffix.casefold() in {".cmd", ".bat"}:
+                # Windows npm shims pass the argument through cmd.exe.
+                settings_json = re.sub(r"[%!^&|<>()]", lambda m: f"\\u{ord(m[0]):04x}", settings_json)
+            cmd.extend(["--settings", settings_json])
+        return cmd
     return [str(exe), "exec", "-m", role.model, "-c", f'model_reasoning_effort="{role.effort}"',
             "--ignore-user-config", "-C", str(worktree), "-s", "workspace-write",
             *platform.codex_sandbox_args(), "-"]

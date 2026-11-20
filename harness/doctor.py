@@ -18,6 +18,7 @@ from harness.roles import Role, lead_candidates
 from harness.runner import safe_env
 
 CODEX_MIN = (0, 171, 0)
+_CODEX_SANDBOX_ACCOUNTS = ("CodexSandboxOffline", "CodexSandboxOnline")
 _ICON = {"ok": "✅", "warn": "⚠", "fail": "✗"}
 
 
@@ -68,6 +69,59 @@ def _brain_dir(root: Path) -> Check:
     return Check("brain-dir", "ok", "folder exists")
 
 
+def _windows_sandbox_accounts(env: dict[str, str]) -> dict[str, str]:
+    names = ", ".join(f"'{name}'" for name in _CODEX_SANDBOX_ACCOUNTS)
+    script = f"""
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+foreach ($name in {names}) {{
+    $account = [Security.Principal.NTAccount]::new([Environment]::MachineName, $name)
+    try {{
+        $sid = $account.Translate([Security.Principal.SecurityIdentifier])
+        "$($account.Value)`t$($sid.Value)"
+    }} catch [Security.Principal.IdentityNotMappedException] {{}}
+}}
+"""
+    proc = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, encoding="utf-8", env=env, timeout=15, check=True)
+    return dict(line.rsplit("\t", 1) for line in proc.stdout.splitlines() if "\t" in line)
+
+
+def _read_denied_accounts(acl: str) -> set[str]:
+    denied = set()
+    for line in acl.splitlines():
+        account, _, permissions = line.rpartition(":")
+        flags = set(re.findall(r"[A-Z]+", permissions.upper()))
+        if (account.strip() and {"DENY", "OI", "CI"} <= flags and not flags & {"IO", "NP"}
+                and flags & {"R", "RX", "M", "F", "GR", "GA", "RD"}):
+            denied.add(account.rsplit(maxsplit=1)[-1].lstrip("*").casefold())
+    return denied
+
+
+def _brain_isolation(root: Path) -> Check:
+    name = "brain-isolation"
+    path = env_path(root, "JAVIS_BRAIN_DIR")
+    if path is None:
+        return Check(name, "warn", "not set")
+    if not platform.is_windows():
+        return Check(name, "ok", "claude sandbox denyRead applied at dispatch (codex: unverified)")
+    env = safe_env(os.environ, {})
+    try:
+        accounts = _windows_sandbox_accounts(env)
+        if not accounts:
+            return Check(name, "ok", "no local Codex sandbox accounts found")
+        acl = subprocess.run(["icacls", str(path)], capture_output=True, encoding="oem", errors="replace",
+                             env=env, timeout=15, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return Check(name, "fail", "could not verify Codex sandbox ACL")
+    denied = _read_denied_accounts(acl)
+    missing = [account.rsplit("\\", 1)[-1] for account, sid in accounts.items()
+               if not {account.casefold(), sid.casefold()} & denied]
+    if missing:
+        entries = " ".join(f'"{account}:(OI)(CI)R"' for account in missing)
+        return Check(name, "fail", "Codex sandbox read deny ACE missing", f'icacls "%JAVIS_BRAIN_DIR%" /deny {entries}')
+    return Check(name, "ok", "Codex sandbox read denied")
+
+
 def _tool_checks() -> list[Check]:
     checks = []
     py = sys.version_info
@@ -100,6 +154,7 @@ def run_checks(root: Path, probe: bool = False) -> list[Check]:
                         None if hooks == ".githooks" else "harness doctor --fix"))
     checks.append(_env_keys(root))
     checks.append(_brain_dir(root))
+    checks.append(_brain_isolation(root))
     has_eol = (root / ".gitattributes").exists()
     checks.append(Check("eol", "ok" if has_eol else "warn", ".gitattributes" if has_eol else "missing"))
     checks.append(_lead_check(root, probe))
