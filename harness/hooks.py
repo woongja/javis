@@ -66,6 +66,30 @@ def scan_all(repo: Path) -> list[str]:
     return problems
 
 
+def scan_history(repo: Path) -> list[str]:
+    history = _git(
+        repo, "-c", "core.quotePath=false", "log", "--all", "-p", "-U0", "--no-color",
+        "--format=commit %h", "--no-notes", "--no-show-signature", "--no-ext-diff",
+        "--no-textconv", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/",
+    )
+    problems = []
+    for commit_patch in ("\n" + history).split("\ncommit ")[1:]:
+        header, *file_patches = commit_patch.split("\ndiff --git ")
+        commit = header.partition("\n")[0]
+        for file_patch in file_patches:
+            findings = scan_text("\n".join(added_lines(file_patch)))
+            if findings:
+                # The destination header keeps the entire path, including spaces.
+                _, _, destination = file_patch.partition("\n+++ ")
+                path = destination.partition("\n")[0].removesuffix("\t")
+                if path.startswith('"b/'):
+                    path = '"' + path[3:]
+                else:
+                    path = path.removeprefix("b/")
+                problems += [f"{commit} {path}: {finding.snippet}" for finding in findings]
+    return problems
+
+
 def _cmd_claude_pre(args: argparse.Namespace) -> int:
     repo = repo_root()
     try:
@@ -86,7 +110,8 @@ def _cmd_git_pre_commit(args: argparse.Namespace) -> int:
 
 
 def _cmd_scan_all(args: argparse.Namespace) -> int:
-    problems = scan_all(repo_root())
+    repo = repo_root()
+    problems = scan_history(repo) if args.history else scan_all(repo)
     for problem in problems:
         print(problem)
     return 1 if problems else 0
@@ -97,4 +122,6 @@ def register(subparsers) -> None:
     sub = hook.add_subparsers(dest="hook", required=True)
     sub.add_parser("claude-pre").set_defaults(func=_cmd_claude_pre)
     sub.add_parser("git-pre-commit").set_defaults(func=_cmd_git_pre_commit)
-    sub.add_parser("scan-all").set_defaults(func=_cmd_scan_all)
+    scan = sub.add_parser("scan-all")
+    scan.add_argument("--history", action="store_true", help="scan added lines across all Git refs")
+    scan.set_defaults(func=_cmd_scan_all)

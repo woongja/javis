@@ -5,7 +5,7 @@ import pytest
 
 from harness.cli import main
 from harness.guards import GuardContext
-from harness.hooks import claude_pre, git_pre_commit
+from harness.hooks import claude_pre, git_pre_commit, scan_all
 from tests.conftest import run
 
 
@@ -77,6 +77,47 @@ def test_cli_scan_all(git_repo, monkeypatch, capsys):
     run(["git", "add", "leak.txt"], git_repo)
     assert main(["hook", "scan-all"]) == 1
     assert "leak.txt" in capsys.readouterr().out
+
+
+def test_cli_scan_history_finds_removed_line(git_repo, monkeypatch, capsys):
+    monkeypatch.chdir(git_repo)
+    user_path = "C:" + "\\Users\\" + "alice"
+    filename = "old notes.txt"
+    notes = git_repo / filename
+    notes.write_text(f"saved at {user_path}\n", encoding="utf-8")
+    (git_repo / "binary.dat").write_bytes(b"\0" + user_path.encode("utf-8"))
+    run(["git", "add", filename, "binary.dat"], git_repo)
+    run(["git", "commit", "-qm", "add old notes"], git_repo)
+    original = run(["git", "rev-parse", "--short", "HEAD"], git_repo).strip()
+    notes.write_text("clean\n", encoding="utf-8")
+    (git_repo / "binary.dat").unlink()
+    run(["git", "add", "-u"], git_repo)
+    run(["git", "commit", "-qm", "remove old data"], git_repo)
+
+    assert scan_all(git_repo) == []
+    assert main(["hook", "scan-all"]) == 0
+    assert capsys.readouterr().out == ""
+    assert main(["hook", "scan-all", "--history"]) == 1
+    output = capsys.readouterr().out
+    assert output == f"{original} {filename}: windows user path on line 1\n"
+    assert user_path not in output
+
+
+def test_cli_scan_history_clean(git_repo, monkeypatch, capsys):
+    monkeypatch.chdir(git_repo)
+    assert main(["hook", "scan-all", "--history"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_scan_history_honors_allow_marker(git_repo, monkeypatch, capsys):
+    monkeypatch.chdir(git_repo)
+    user_path = "C:" + "\\Users\\" + "alice"
+    (git_repo / "example.txt").write_text(f"{user_path}  # harness:allow\n", encoding="utf-8")
+    run(["git", "add", "example.txt"], git_repo)
+    run(["git", "commit", "-qm", "add allowed example"], git_repo)
+
+    assert main(["hook", "scan-all", "--history"]) == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_claude_pre_blocks_git_commit_via_powershell(ctx):
