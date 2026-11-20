@@ -61,6 +61,34 @@ def test_env_keys_no_values(git_repo, fake_bins, monkeypatch, capsys):
     assert "secretpath" not in out and "env-keys" in out
 
 
+@pytest.mark.parametrize(("configured", "exists", "status"), [
+    (True, False, "fail"),
+    (True, True, "ok"),
+    (False, False, "warn"),
+])
+def test_brain_dir(git_repo, fake_bins, monkeypatch, capsys, configured, exists, status):
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    brain_dir = git_repo / "example-brain-folder"
+    if exists:
+        brain_dir.mkdir()
+    value = str(brain_dir) if configured else ""
+    (git_repo / ".env").write_text(f"JAVIS_BRAIN_DIR={value}\n", encoding="utf-8")
+
+    check = _checks(git_repo)["brain-dir"]
+    assert check.status == status
+    if status == "fail":
+        assert check.detail == "JAVIS_BRAIN_DIR points to a missing folder"
+        assert check.fix == "fix the path in .env"
+    elif status == "warn":
+        assert check.detail == "not set"
+
+    monkeypatch.chdir(git_repo)
+    main(["doctor"])
+    output = capsys.readouterr()
+    assert "brain-dir" in output.out
+    assert brain_dir.name not in output.out + output.err
+
+
 def test_fix_sets_hooks_path(git_repo, fake_bins, monkeypatch):
     monkeypatch.chdir(git_repo)
     assert _checks(git_repo)["hooksPath"].status == "fail"

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from harness.paths import env_value, repo_root, state_dir
+from harness.paths import env_path, env_value, repo_root, state_dir
 from harness import platform
 from harness.platform import find_exe
 from harness.roles import Role, lead_candidates
@@ -59,6 +59,15 @@ def _env_keys(root: Path) -> Check:
     return Check("env-keys", "ok", f"{len(wanted)} key(s) set")
 
 
+def _brain_dir(root: Path) -> Check:
+    path = env_path(root, "JAVIS_BRAIN_DIR")
+    if path is None:
+        return Check("brain-dir", "warn", "not set")
+    if not path.is_dir():
+        return Check("brain-dir", "fail", "JAVIS_BRAIN_DIR points to a missing folder", "fix the path in .env")
+    return Check("brain-dir", "ok", "folder exists")
+
+
 def _tool_checks() -> list[Check]:
     checks = []
     py = sys.version_info
@@ -90,6 +99,7 @@ def run_checks(root: Path, probe: bool = False) -> list[Check]:
     checks.append(Check("hooksPath", "ok" if hooks == ".githooks" else "fail", hooks or "unset",
                         None if hooks == ".githooks" else "harness doctor --fix"))
     checks.append(_env_keys(root))
+    checks.append(_brain_dir(root))
     has_eol = (root / ".gitattributes").exists()
     checks.append(Check("eol", "ok" if has_eol else "warn", ".gitattributes" if has_eol else "missing"))
     checks.append(_lead_check(root, probe))
