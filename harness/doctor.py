@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from harness.paths import repo_root, state_dir
+from harness.paths import env_value, repo_root, state_dir
 from harness import platform
 from harness.platform import find_exe
 from harness.roles import Role, lead_candidates
@@ -53,14 +53,7 @@ def _env_keys(root: Path) -> Check:
         return Check("env-keys", "ok", "no .env.example")
     wanted = [l.split("=", 1)[0].strip() for l in example.read_text(encoding="utf-8").splitlines()
               if "=" in l and not l.lstrip().startswith("#")]
-    have = set(k for k, v in os.environ.items() if v)
-    env_file = root / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            key, _, value = line.partition("=")
-            if value.strip():
-                have.add(key.strip())
-    missing = [k for k in wanted if k not in have]
+    missing = [k for k in wanted if not env_value(root, k)]
     if missing:
         return Check("env-keys", "warn", f"not set: {', '.join(missing)}", "fill them in .env (never commit it)")
     return Check("env-keys", "ok", f"{len(wanted)} key(s) set")

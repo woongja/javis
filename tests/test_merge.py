@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,10 +16,13 @@ from tests.conftest import run
 HARNESS_SRC = Path(__file__).resolve().parents[1]
 
 
-def test_merge_happy(gated_task):
+def test_merge_happy(gated_task, monkeypatch):
     root, task_id = gated_task
+    archive = Mock()
+    monkeypatch.setattr(merge_module.shutil, "copytree", archive)
     sha, warnings = merge(root, task_id)
     assert warnings == []
+    archive.assert_not_called()
     assert run(["git", "log", "-1", "--format=%s"], root).strip() == f"feat(codex)({task_id}): demo"
     assert run(["git", "rev-parse", "HEAD"], root).strip() == sha
     assert (root / "hud" / "demo.txt").exists()
@@ -73,10 +77,22 @@ def test_merge_rejects_dirty_main(gated_task):
         merge(*gated_task)
 
 
-def test_merge_archives_handoff(gated_task, tmp_path, monkeypatch):
-    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "brain"))
-    merge(*gated_task)
-    assert (tmp_path / "brain" / "javis-dev" / "handoff" / gated_task[1] / "spec.md").exists()
+@pytest.mark.parametrize("use_process_env", [False, True], ids=["dotenv-only", "process-env-wins"])
+def test_merge_archives_handoff(gated_task, tmp_path, monkeypatch, use_process_env):
+    root, task_id = gated_task
+    dotenv_brain = tmp_path / "dotenv brain"
+    (root / ".env").write_text(f"JAVIS_BRAIN_DIR={dotenv_brain}\n", encoding="utf-8")
+    brain = dotenv_brain
+    if use_process_env:
+        brain = tmp_path / "process brain"
+        monkeypatch.setenv("JAVIS_BRAIN_DIR", str(brain))
+
+    _, warnings = merge(root, task_id)
+
+    assert warnings == []
+    assert (brain / "javis-dev" / "handoff" / task_id / "spec.md").is_file()
+    if use_process_env:
+        assert not dotenv_brain.exists()
 
 
 def test_merge_reports_branch_and_archive_failures(gated_task, tmp_path, monkeypatch):
@@ -103,8 +119,9 @@ def test_merge_reports_branch_and_archive_failures(gated_task, tmp_path, monkeyp
     ]
 
 
-def test_pre_commit_hook_allows_merge(gated_task, monkeypatch):
-    root, task_id = gated_task
+@pytest.fixture
+def gated_task_with_hook(git_repo_with_harness, monkeypatch, request):
+    root = git_repo_with_harness
     hook = root / ".githooks" / "pre-commit"
     hook.parent.mkdir()
     hook.write_text(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" -m harness.cli hook git-pre-commit\n',
@@ -114,5 +131,13 @@ def test_pre_commit_hook_allows_merge(gated_task, monkeypatch):
     run(["git", "commit", "-q", "-m", "hooks"], root)
     run(["git", "config", "core.hooksPath", ".githooks"], root)
     monkeypatch.setenv("PYTHONPATH", str(HARNESS_SRC) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    return request.getfixturevalue("gated_task")
+
+
+def test_pre_commit_hook_allows_merge(gated_task_with_hook):
+    root, task_id = gated_task_with_hook
+    wt = worktree_dir(root, task_id)
+    assert (wt / ".githooks" / "pre-commit").is_file()
+    assert run(["git", "config", "--get", "core.hooksPath"], wt).strip() == ".githooks"
     merge(root, task_id)
     assert load(root, task_id).status == "merged"

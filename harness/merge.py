@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from harness import HarnessError, ledger
-from harness.paths import handoff_dir, repo_root, worktree_dir
+from harness.paths import env_value, handoff_dir, repo_root, worktree_dir
 from harness.tasks import load, save
 
 BASE_BRANCH = "main"
@@ -73,13 +73,13 @@ def merge(root: Path, task_id: str) -> tuple[str, list[str]]:
         _git(root, "branch", "-D", task.branch)
     except (HarnessError, OSError) as exc:
         warnings.append(f"branch deletion failed: {exc}")
-    brain = os.environ.get("JAVIS_BRAIN_DIR")
-    if brain:
-        try:
+    try:
+        brain = env_value(root, "JAVIS_BRAIN_DIR")
+        if brain:
             shutil.copytree(handoff_dir(root, task_id), Path(brain) / "javis-dev" / "handoff" / task_id,
                             symlinks=True, dirs_exist_ok=True)
-        except OSError as exc:
-            warnings.append(f"archive to brain failed: {exc}")
+    except (OSError, UnicodeError) as exc:
+        warnings.append(f"archive to brain failed: {exc}")
     return sha, warnings
 
 

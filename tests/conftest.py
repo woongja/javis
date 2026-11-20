@@ -40,7 +40,7 @@ def fake_bins(tmp_path, monkeypatch) -> dict[str, Path]:
 @pytest.fixture
 def git_repo_with_harness(git_repo) -> Path:
     """A repo whose .gitignore hides harness state, like the real project."""
-    (git_repo / ".gitignore").write_text(".harness/\n.handoff/\n.task/\n.fake-args.txt\n", encoding="utf-8")
+    (git_repo / ".gitignore").write_text(".env\n.harness/\n.handoff/\n.task/\n.fake-args.txt\n", encoding="utf-8")
     run(["git", "add", ".gitignore"], git_repo)
     run(["git", "commit", "-q", "-m", "ignore state"], git_repo)
     return git_repo
@@ -70,9 +70,10 @@ def dispatched_task(git_repo_with_harness, fake_bins) -> tuple[Path, str]:
 
 
 @pytest.fixture
-def gated_task(dispatched_task) -> tuple[Path, str]:
+def gated_task(dispatched_task, monkeypatch) -> tuple[Path, str]:
     from harness.gate import run_gate
 
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
     set_gate(*dispatched_task, [HUD_EXISTS])
     assert run_gate(*dispatched_task).passed
     return dispatched_task
