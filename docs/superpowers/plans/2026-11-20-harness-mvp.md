@@ -205,7 +205,7 @@ def test_pre_commit_blocks_agent(git_repo):
     assert git_pre_commit(git_repo, {"JAVIS_AGENT": "1", "JAVIS_MERGE": "1"})[0] == 0
 
 def test_pre_commit_blocks_user_path(git_repo):
-    (git_repo/"b.md").write_text("see /Users/bob/notes\n"); run(["git","add","b.md"], git_repo)
+    (git_repo/"b.md").write_text("see /Users/bob/notes\n"); run(["git","add","b.md"], git_repo) <!-- harness:allow -->
     code, msg = git_pre_commit(git_repo, {}); assert code != 0 and "R7" in msg
 
 def test_cli_claude_pre_stdin(monkeypatch, capsys, ctx_repo):  # stdin JSON → exit 2
@@ -334,7 +334,7 @@ def test_parse_crlf():
 
 def test_empty_gate_fails(dispatched_task): assert not run_gate(*dispatched_task).passed
 def test_gate_pass(dispatched_task_with_gate_cmd_python_exit0): ...   # passed, gate.json 존재, status == "gated"
-def test_gate_blocks_r7(...):  # worktree에 "/Users/bob/x" 줄 추가 → passed False, results에 R7 언급
+def test_gate_blocks_r7(...):  # worktree에 "/Users/bob/x" 줄 추가 → passed False, results에 R7 언급 <!-- harness:allow -->
 ```
 - [ ] **Step 2: 실패 확인** → **Step 3: 구현** → **Step 4: 통과 확인** → **Step 5: Commit** `feat: gate`
 

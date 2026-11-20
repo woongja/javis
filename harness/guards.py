@@ -110,8 +110,8 @@ _SAFE_EMAIL_DOMAIN = re.compile(r"@(example\.(com|org|net)|[\w.-]+\.(invalid|tes
 _PATTERNS = [
     ("email", re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")),
     ("windows user path", re.compile(r"[A-Za-z]:\\Users\\[^\\\s<]+")),
-    ("mac user path", re.compile(r"/Users/[^/\s<]+/")),
-    ("linux home path", re.compile(r"/home/[^/\s<]+/")),
+    ("mac user path", re.compile(r"/Users/[^/\s<]+/")),  # harness:allow
+    ("linux home path", re.compile(r"/home/[^/\s<]+/")),  # harness:allow
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("api key", re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
     ("github token", re.compile(r"\bghp_[A-Za-z0-9]{30,}")),

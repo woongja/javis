@@ -101,7 +101,7 @@ def test_scan_ignores_reserved_example_domains():
         "-----BEGIN OPENSSH PRIVATE KEY-----",  # harness:allow
         "sk-" + "a" * 24,
         "ghp_" + "b" * 36,
-        "xoxb-123",
+        "xoxb-123",  # harness:allow
         "AKIA" + "A" * 16,
     ],
 )
