@@ -61,11 +61,12 @@ def test_merge_records_merged_before_archive(gated_task, monkeypatch, tmp_path):
     monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "brain"))
 
     def fail_copy(*a, **k):
+        assert load(*gated_task).status == "merged"
         raise OSError("disk full")
 
     monkeypatch.setattr("harness.merge.shutil.copytree", fail_copy)
-    with pytest.raises(HarnessError, match="archive"):
-        merge(*gated_task)
+    _, warnings = merge(*gated_task)
+    assert warnings == ["archive to brain failed: disk full"]
     assert load(*gated_task).status == "merged"
 
 

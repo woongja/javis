@@ -5,6 +5,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from harness import HarnessError, ledger
@@ -37,7 +38,7 @@ def _check_preconditions(root: Path, task_id: str) -> Path:
     return wt
 
 
-def merge(root: Path, task_id: str) -> str:
+def merge(root: Path, task_id: str) -> tuple[str, list[str]]:
     wt = _check_preconditions(root, task_id)
     task = load(root, task_id)
     env = {k: v for k, v in os.environ.items() if k.upper() != "JAVIS_AGENT"}
@@ -51,21 +52,42 @@ def merge(root: Path, task_id: str) -> str:
     sha = _git(root, "rev-parse", "HEAD").strip()
     task.status = "merged"  # recorded before cleanup so a later failure never hides the merge
     save(root, task)
-    ledger.append(root, "merge", task=task_id, sha=sha)
-    _git(root, "worktree", "remove", "--force", str(wt))
-    _git(root, "branch", "-D", task.branch)
+    warnings = []
+    try:
+        ledger.append(root, "merge", task=task_id, sha=sha)
+    except OSError as exc:
+        warnings.append(f"merge ledger write failed: {exc}")
+    try:
+        _git(root, "worktree", "remove", "--force", str(wt))
+    except (HarnessError, OSError) as exc:
+        warnings.append(f"worktree removal failed: {exc}")
+        # Git won't delete a branch that's still checked out in a worktree.
+        try:
+            if (wt / ".git").is_file():
+                _git(wt, "switch", "--detach")
+            else:
+                _git(root, "worktree", "prune", "--expire", "now")
+        except (HarnessError, OSError):
+            pass  # Attempt branch deletion even if releasing the checkout failed.
+    try:
+        _git(root, "branch", "-D", task.branch)
+    except (HarnessError, OSError) as exc:
+        warnings.append(f"branch deletion failed: {exc}")
     brain = os.environ.get("JAVIS_BRAIN_DIR")
     if brain:
         try:
             shutil.copytree(handoff_dir(root, task_id), Path(brain) / "javis-dev" / "handoff" / task_id,
                             symlinks=True, dirs_exist_ok=True)
         except OSError as exc:
-            raise HarnessError(f"merged as {sha[:7]}, but archive to brain failed: {exc}") from exc
-    return sha
+            warnings.append(f"archive to brain failed: {exc}")
+    return sha, warnings
 
 
 def _cmd_merge(args: argparse.Namespace) -> int:
-    print(merge(repo_root(), args.task_id))
+    sha, warnings = merge(repo_root(), args.task_id)
+    print(sha)
+    for warning in warnings:
+        print(f"warning: merged as {sha[:7]}, but {' '.join(warning.splitlines())}", file=sys.stderr)
     return 0
 
 

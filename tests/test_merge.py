@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+import harness.merge as merge_module
 from harness import HarnessError
+from harness.cli import main
 from harness.merge import merge
 from harness.paths import worktree_dir
 from harness.tasks import load
@@ -15,13 +17,43 @@ HARNESS_SRC = Path(__file__).resolve().parents[1]
 
 def test_merge_happy(gated_task):
     root, task_id = gated_task
-    sha = merge(root, task_id)
+    sha, warnings = merge(root, task_id)
+    assert warnings == []
     assert run(["git", "log", "-1", "--format=%s"], root).strip() == f"feat(codex)({task_id}): demo"
     assert run(["git", "rev-parse", "HEAD"], root).strip() == sha
     assert (root / "hud" / "demo.txt").exists()
     assert not worktree_dir(root, task_id).exists()
     assert "task/" not in run(["git", "branch"], root)
     assert load(root, task_id).status == "merged"
+
+
+def test_merge_cli_continues_cleanup_after_worktree_removal_fails(gated_task, monkeypatch, tmp_path, capsys):
+    root, task_id = gated_task
+    task = load(root, task_id)
+    brain = tmp_path / "brain"
+    git = merge_module._git
+
+    def fail_worktree_remove(cwd, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            raise HarnessError("directory locked\naccess denied")
+        return git(cwd, *args, **kwargs)
+
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(brain))
+    monkeypatch.setattr(merge_module, "_git", fail_worktree_remove)
+
+    assert main(["merge", task_id]) == 0
+
+    sha = run(["git", "rev-parse", "main"], root).strip()
+    assert run(["git", "log", "-1", "--format=%s", "main"], root).strip() == f"feat(codex)({task_id}): demo"
+    assert (root / "hud" / "demo.txt").exists()
+    assert load(root, task_id).status == "merged"
+    assert worktree_dir(root, task_id).exists()
+    assert not run(["git", "branch", "--list", task.branch], root).strip()
+    assert (brain / "javis-dev" / "handoff" / task_id / "spec.md").exists()
+    captured = capsys.readouterr()
+    assert captured.out == f"{sha}\n"
+    assert captured.err == f"warning: merged as {sha[:7]}, but worktree removal failed: directory locked access denied\n"
 
 
 def test_merge_rejects_ungated(dispatched_task):
@@ -45,6 +77,30 @@ def test_merge_archives_handoff(gated_task, tmp_path, monkeypatch):
     monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "brain"))
     merge(*gated_task)
     assert (tmp_path / "brain" / "javis-dev" / "handoff" / gated_task[1] / "spec.md").exists()
+
+
+def test_merge_reports_branch_and_archive_failures(gated_task, tmp_path, monkeypatch):
+    git = merge_module._git
+
+    def fail_branch_delete(cwd, *args, **kwargs):
+        if args[:2] == ("branch", "-D"):
+            raise HarnessError("branch ref locked")
+        return git(cwd, *args, **kwargs)
+
+    def fail_archive(*args, **kwargs):
+        assert load(*gated_task).status == "merged"
+        raise OSError("disk full")
+
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "brain"))
+    monkeypatch.setattr(merge_module, "_git", fail_branch_delete)
+    monkeypatch.setattr(merge_module.shutil, "copytree", fail_archive)
+
+    _, warnings = merge(*gated_task)
+
+    assert warnings == [
+        "branch deletion failed: branch ref locked",
+        "archive to brain failed: disk full",
+    ]
 
 
 def test_pre_commit_hook_allows_merge(gated_task, monkeypatch):
