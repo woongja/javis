@@ -11,6 +11,31 @@ def is_windows() -> bool:
     return sys.platform == "win32"
 
 
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if is_windows():
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def find_exe(name: str, env_override: str | None = None) -> Path | None:
     """Locate an executable. An override env var (e.g. JAVIS_CODEX_BIN) wins.
 
