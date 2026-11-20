@@ -11,6 +11,8 @@ instruction source; `CLAUDE.md` just imports it. Keep it under 100 lines.
   dispatches, judges gates, and is the only one who merges. The lead does not write the "how".
 - Ownership: Claude team = `core/ brain/ security/ channels/telegram/`;
   Codex team = `hud/ worklog/ workshop/ teams/`. Cross review: the other team reviews.
+- On Windows, dispatch code tasks to Codex workers only; use Claude workers on macOS/Linux.
+  Claude Code sandbox `denyRead` is unsupported on native Windows, so a Claude worker's shell can read the brain vault.
 
 ## Workflow (one task)
 1. `uv run harness task new "<title>" --owner claude|codex` → fill `.handoff/<id>/spec.md`,
@@ -29,6 +31,11 @@ instruction source; `CLAUDE.md` just imports it. Keep it under 100 lines.
 | R4 | No raw `git commit/push/merge/rebase/reset --hard/--no-verify`; use `harness merge` (lead may run plain `git push` to origin, no force or delete) | only the lead commits, after gate / when merges move server-side |
 | R5 | Child processes get an allow-listed environment (no API keys) | subscription billing only, no secret leaks / never |
 | R7 | Commits and gates reject personal data and secret patterns (`harness:allow` marks intentional lines) | this repo becomes public / never |
+
+- Claude workers use the PreToolUse hook (`harness hook claude-pre`) and sandbox `denyRead` for the brain vault (macOS/Linux only).
+- Codex workers use the PreToolUse hook (`harness hook codex-pre`), which fails closed on hook errors. `harness dispatch` passes `--dangerously-bypass-hook-trust`.
+  An OS ACL denies Codex sandbox accounts access to the brain folder (`harness doctor` → `brain-isolation`).
+- Shell-path checks are heuristic. OS isolation is the enforcement boundary.
 
 Add a rule only after a real failure, and write why it exists and when it may be removed.
 
