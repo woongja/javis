@@ -60,3 +60,15 @@
 ## 4. 열린 질문 (사용자)
 - A1에서 OS ACL 변경이 필요할 때 실행 주체(사용자 관리자 터미널).
 - 2단계 전체를 건너뛰고 본체부터 갈지 — 총괄 추천은 **A1만 먼저, 나머지는 본체 작업과 병행**.
+
+## 5. 진행 결과 (2026-11-21)
+
+- A1 T012·T013 완료. `harness doctor`에 `brain-isolation` 점검을 추가했고, Codex 샌드박스 계정의 읽기 거부 ACL은 사용자 승인 후 적용한다. Claude 샌드박스 `denyRead`는 Windows에서 지원되지 않아 Windows에서는 Codex 작업자만 사용한다.
+- A2 T014 완료. 명령줄에서 `-c hooks.PreToolUse`와 `--dangerously-bypass-hook-trust`를 전달한다. 저장소의 `.codex/hooks.json`은 로드되지 않는다. Windows 훅은 PowerShell에서 실행하며, 훅 오류 시 차단한다(fail-closed).
+- A3 T017 완료. Claude 리뷰어는 `--restricted --safe-mode --strict-mcp-config --tools Read,Grep,Glob`과 `permissions.deny`를 적용해 실행한다.
+- A4 T016 완료.
+- B1·B2 T018 완료.
+- B3 보류(실측 전).
+- 문서 T015·T019.
+- 남은 위험. gate 명령은 작업자 코드를 총괄 권한으로 실행한다(격리 미구현). Claude 작업자의 PreToolUse 훅은 worktree의 하네스 코드를 실행한다(Windows에서는 Claude 작업자 미사용). 셸 경로 검사는 휴리스틱이다.
+- 하네스 1,314줄(상한 1,400).

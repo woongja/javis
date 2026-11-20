@@ -10,7 +10,7 @@ instruction source; `CLAUDE.md` just imports it. Keep it under 100 lines.
   says which tool to open it in. The lead writes specs (what / why / done-criteria),
   dispatches, judges gates, and is the only one who merges. The lead does not write the "how".
 - Ownership: Claude team = `core/ brain/ security/ channels/telegram/`;
-  Codex team = `hud/ worklog/ workshop/ teams/`. Cross review: the other team reviews.
+  Codex team = `hud/ worklog/ workshop/ teams/`. `harness review` enforces opposite-team review.
 - On Windows, dispatch code tasks to Codex workers only; use Claude workers on macOS/Linux.
   Claude Code sandbox `denyRead` is unsupported on native Windows, so a Claude worker's shell can read the brain vault.
 
@@ -18,8 +18,12 @@ instruction source; `CLAUDE.md` just imports it. Keep it under 100 lines.
 1. `uv run harness task new "<title>" --owner claude|codex` → fill `.handoff/<id>/spec.md`,
    including the ```gate block (one command per line, all must exit 0).
 2. `uv run harness dispatch <id> --role <team.role>` → worker runs in `../javis-wt/<id>`.
-3. `uv run harness gate <id>` → commands + personal-data scan. Opinions do not pass a gate.
-4. `uv run harness merge <id>` → squash commit on main (lead only).
+3. `uv run harness review <id>` → runs the opposite-team reviewer in read-only mode and writes `.handoff/<id>/review.md`.
+4. `uv run harness gate <id>` → commands + personal-data scan. Opinions do not pass a gate.
+   Changes touching `harness/`, `security/`, `.githooks/`, `.github/`, `.claude/`, or `AGENTS.md`, or changing 50 or more lines, require an opposite-team `VERDICT: pass` for the same tree.
+5. `uv run harness merge <id>` → squash commit on main (lead only).
+   Merge refuses if main has changed any of the same files since the task base.
+- Usage: `uv run harness usage [--by team|model|role|task]`.
 - At most 4 handoffs per task. One run per tool at a time.
 - A run that hits a usage limit is marked `blocked:quota` and is not retried automatically.
 
@@ -28,6 +32,7 @@ instruction source; `CLAUDE.md` just imports it. Keep it under 100 lines.
 |---|---|---|
 | R1 | No read/write of `.env*` (except `.env.example`), `secrets/`, the brain vault, `~/.claude`, `~/.codex`, `~/.ssh` | secrets and the private brain never reach dev agents / never |
 | R2 | A worker writes only inside its own worktree | parallel teams collide otherwise / never |
+| R3 | A task changes only the paths in its spec's "건드릴 경로" section (fallback: roles.toml ownership) | out-of-spec changes slip in without review / never |
 | R4 | No raw `git commit/push/merge/rebase/reset --hard/--no-verify`; use `harness merge` (lead may run plain `git push` to origin, no force or delete) | only the lead commits, after gate / when merges move server-side |
 | R5 | Child processes get an allow-listed environment (no API keys) | subscription billing only, no secret leaks / never |
 | R7 | Commits and gates reject personal data and secret patterns (`harness:allow` marks intentional lines) | this repo becomes public / never |
