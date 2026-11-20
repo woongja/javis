@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from harness.guards import GuardContext, check_command, check_path, scan_text
+from harness.hooks import claude_pre
 
 
 @pytest.fixture
@@ -61,7 +62,6 @@ def test_worker_write_outside_worktree(worker_ctx):
     "cmd",
     [
         "git commit -m x",
-        "git push",
         "git -C . merge t",
         "git commit --no-verify",
         "git rebase main",
@@ -71,6 +71,64 @@ def test_worker_write_outside_worktree(worker_ctx):
 )
 def test_git_blocked(cmd, ctx):
     assert check_command(cmd, ctx).rule == "R4"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git push",
+        "git push origin",
+        "git push origin main",
+        "git push -u origin feat/x",
+        " \tgit push origin main \t",
+    ],
+)
+def test_lead_plain_push_allowed(cmd, ctx):
+    assert check_command(cmd, ctx).allowed
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git push --force",
+        "git push -f origin main",
+        "git push --force-with-lease",
+        "git push --force-if-includes",
+        "git push origin +main",
+        "git push origin :main",
+        "git push --delete origin main",
+        "git push -d origin main",
+        "git push --mirror",
+        "git push --all",
+        "git push --tags",
+        "git push --prune",
+        "git push --no-verify",
+        "git push upstream main",
+        "git push origin main other",
+        "git push origin main; rm -rf x",
+        "git push && git commit -m x",
+        "git push || git status",
+        "git push | cat",
+        "git push\n",
+        "\ngit push",
+        "git push origin main\r\ngit status",
+        "git push origin `git status`",
+        "git push origin $(git status)",
+    ],
+)
+def test_lead_push_outside_allowlist_blocked(cmd, ctx):
+    assert check_command(cmd, ctx).rule == "R4"
+
+
+@pytest.mark.parametrize("cmd", ["git push", "git push origin main"])
+def test_worker_plain_push_blocked(cmd, worker_ctx):
+    assert check_command(cmd, worker_ctx).rule == "R4"
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_claude_pre_allows_lead_plain_push(tool, ctx):
+    payload = {"tool_name": tool, "tool_input": {"command": "git push origin main"}}
+    assert claude_pre(payload, ctx) == (0, "")
 
 
 @pytest.mark.parametrize("cmd", ["git status", "git diff main", "git log --oneline", "uv run pytest -q"])

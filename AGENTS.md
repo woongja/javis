@@ -26,7 +26,7 @@ instruction source; `CLAUDE.md` just imports it. Keep it under 100 lines.
 |---|---|---|
 | R1 | No read/write of `.env*` (except `.env.example`), `secrets/`, the brain vault, `~/.claude`, `~/.codex`, `~/.ssh` | secrets and the private brain never reach dev agents / never |
 | R2 | A worker writes only inside its own worktree | parallel teams collide otherwise / never |
-| R4 | No raw `git commit/push/merge/rebase/reset --hard/--no-verify`; use `harness merge` | only the lead commits, after gate / when merges move server-side |
+| R4 | No raw `git commit/push/merge/rebase/reset --hard/--no-verify`; use `harness merge` (lead may run plain `git push` to origin, no force or delete) | only the lead commits, after gate / when merges move server-side |
 | R5 | Child processes get an allow-listed environment (no API keys) | subscription billing only, no secret leaks / never |
 | R7 | Commits and gates reject personal data and secret patterns (`harness:allow` marks intentional lines) | this repo becomes public / never |
 

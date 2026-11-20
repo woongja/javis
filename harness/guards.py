@@ -7,6 +7,7 @@ R2  a dispatched worker writes only inside its own worktree.
     why: teams run side by side; stray writes collide. expires: never.
 R4  raw git commit/push/merge/rebase/reset --hard/--no-verify are blocked; use `harness merge`.
     why: only the lead commits, after gate. expires: when merge rules move server-side.
+    exception: the lead session (no worktree) may run a single plain git push to origin.
 R7  personal data / secret patterns in text (pre-commit, gate, CI).
     why: the code repo becomes public. expires: never.
 """
@@ -99,6 +100,11 @@ def check_path(path: Path, op: Literal["read", "write"], ctx: GuardContext) -> V
 
 
 _MERGE_ONLY = re.compile(r"^\s*(uv\s+run\s+(--\S+\s+)*)?harness\s+merge\s+\S+\s*$")
+_PLAIN_PUSH = re.compile(
+    r"[ \t]*git[ \t]+push"
+    r"(?:(?:[ \t]+-u)?[ \t]+origin[ \t]+[A-Za-z0-9_][A-Za-z0-9_./-]*|[ \t]+origin)?"
+    r"[ \t]*"
+)
 _GIT_FORBIDDEN = [
     re.compile(r"\bgit\b[^;&|]*?\s(commit|push|merge|rebase)\b"),
     re.compile(r"\bgit\b[^;&|]*?\sreset\s+[^;&|]*--hard"),
@@ -108,6 +114,8 @@ _GIT_FORBIDDEN = [
 
 def check_command(cmd: str, ctx: GuardContext) -> Verdict:
     if _MERGE_ONLY.match(cmd):
+        return _OK
+    if ctx.worktree is None and _PLAIN_PUSH.fullmatch(cmd):
         return _OK
     for pattern in _GIT_FORBIDDEN:
         if pattern.search(cmd):
