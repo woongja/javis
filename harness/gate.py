@@ -12,8 +12,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from harness import HarnessError, ledger
-from harness.guards import scan_text
+from harness import HarnessError, ledger, platform
+from harness.guards import added_lines, scan_text
 from harness.paths import handoff_dir, repo_root, worktree_dir
 from harness.runner import safe_env
 from harness.tasks import load, save
@@ -33,7 +33,15 @@ def parse_gate_commands(spec_text: str) -> list[list[str]]:
     if not match:
         return []
     lines = (line.strip() for line in match.group(1).splitlines())
-    return [shlex.split(line, posix=True) for line in lines if line and not line.startswith("#")]
+    return [_split(line) for line in lines if line and not line.startswith("#")]
+
+
+def _split(line: str) -> list[str]:
+    if not platform.is_windows():
+        return shlex.split(line, posix=True)
+    # POSIX rules eat backslashes in C:\paths; Windows rules keep them but also keep quotes.
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t
+            for t in shlex.split(line, posix=False)]
 
 
 def _git(wt: Path, *args: str) -> str:
@@ -55,9 +63,7 @@ def _run_one(argv: list[str], wt: Path, env: dict, timeout_s: int) -> dict:
 
 def _r7_check(wt: Path) -> dict | None:
     _git(wt, "add", "-A")  # stage only; workers never commit
-    added = "\n".join(line[1:] for line in _git(wt, "diff", "--cached", "-U0", "--no-color", "HEAD").splitlines()
-                      if line.startswith("+") and not line.startswith("+++"))
-    findings = scan_text(added)
+    findings = scan_text("\n".join(added_lines(_git(wt, "diff", "--cached", "-U0", "--no-color", "HEAD"))))
     if not findings:
         return None
     return {"cmd": "R7 scan: " + "; ".join(f.snippet for f in findings[:5]), "exit": 1, "duration_s": 0}
@@ -68,6 +74,9 @@ def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     wt = worktree_dir(root, task_id)
     if not wt.exists():
         raise HarnessError(f"{task_id} has no worktree; dispatch it first")
+    # Invalidate any earlier approval first, so a crash mid-gate never leaves a stale pass.
+    task.status, task.gate_tree = ("done" if task.status == "gated" else task.status), None
+    save(root, task)
     commands = parse_gate_commands((handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8"))
     env = safe_env(os.environ, {})
     results = [_run_one(argv, wt, env, timeout_s) for argv in commands]
@@ -79,8 +88,9 @@ def run_gate(root: Path, task_id: str, timeout_s: int = 600) -> GateResult:
     result = GateResult(passed, results, tree)
     (handoff_dir(root, task_id) / "gate.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2),
                                                           encoding="utf-8")
-    task.status, task.gate_tree = ("gated", tree) if passed else (task.status if task.status != "gated" else "done", None)
-    save(root, task)
+    if passed:
+        task.status, task.gate_tree = "gated", tree
+        save(root, task)
     ledger.append(root, "gate", task=task_id, passed=passed, commands=len(commands))
     return result
 

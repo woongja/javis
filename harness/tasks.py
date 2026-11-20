@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -42,6 +43,8 @@ def save(root: Path, task: Task) -> None:
 
 
 def load(root: Path, task_id: str) -> Task:
+    if not re.fullmatch(r"T\d{3,}", task_id):
+        raise HarnessError(f"bad task id {task_id!r} (expected like T001)")
     path = _tasks_dir(root) / f"{task_id}.json"
     if not path.exists():
         raise HarnessError(f"unknown task {task_id}")

@@ -22,4 +22,4 @@ def test_find_exe_missing(monkeypatch):
 
 def test_worktree_dir_outside_repo(git_repo):
     wt = worktree_dir(git_repo, "T001")
-    assert wt.parent.name == "javis-wt" and git_repo not in wt.parents
+    assert wt.parent.name == f"{git_repo.name}-wt" and git_repo not in wt.parents

@@ -40,21 +40,27 @@ def _check_preconditions(root: Path, task_id: str) -> Path:
 def merge(root: Path, task_id: str) -> str:
     wt = _check_preconditions(root, task_id)
     task = load(root, task_id)
-    env = {**os.environ, "JAVIS_MERGE": "1"}
-    env.pop("JAVIS_AGENT", None)
-    _git(wt, "commit", "-q", "--allow-empty", "-m", f"wip({task_id})", env=env)
-    _git(root, "merge", "--squash", task.branch, env=env)
+    env = {k: v for k, v in os.environ.items() if k.upper() != "JAVIS_AGENT"}
+    env["JAVIS_MERGE"] = "1"
+    # Commit exactly the tree the gate approved (not whatever the index holds now).
+    parent = _git(wt, "rev-parse", "HEAD").strip()
+    wip = _git(wt, "commit-tree", task.gate_tree, "-p", parent, "-m", f"wip({task_id})", env=env).strip()
+    _git(root, "update-ref", f"refs/heads/{task.branch}", wip, parent)
+    _git(root, "merge", "--squash", "--no-overwrite-ignore", task.branch, env=env)
     _git(root, "commit", "-q", "--allow-empty", "-m", f"feat({task.owner})({task_id}): {task.title}", env=env)
     sha = _git(root, "rev-parse", "HEAD").strip()
+    task.status = "merged"  # recorded before cleanup so a later failure never hides the merge
+    save(root, task)
+    ledger.append(root, "merge", task=task_id, sha=sha)
     _git(root, "worktree", "remove", "--force", str(wt))
     _git(root, "branch", "-D", task.branch)
     brain = os.environ.get("JAVIS_BRAIN_DIR")
     if brain:
-        shutil.copytree(handoff_dir(root, task_id), Path(brain) / "javis-dev" / "handoff" / task_id,
-                        dirs_exist_ok=True)
-    task.status = "merged"
-    save(root, task)
-    ledger.append(root, "merge", task=task_id, sha=sha, archived=bool(brain))
+        try:
+            shutil.copytree(handoff_dir(root, task_id), Path(brain) / "javis-dev" / "handoff" / task_id,
+                            symlinks=True, dirs_exist_ok=True)
+        except OSError as exc:
+            raise HarnessError(f"merged as {sha[:7]}, but archive to brain failed: {exc}") from exc
     return sha
 
 

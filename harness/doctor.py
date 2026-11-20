@@ -37,6 +37,7 @@ def parse_version(text: str) -> tuple[int, int, int]:
 def _version_of(exe: Path) -> str:
     try:
         return subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=30,
+                              env=safe_env(os.environ, {}),
                               encoding="utf-8", errors="replace").stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"error: {exc}"

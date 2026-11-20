@@ -12,9 +12,9 @@ from harness.tasks import load, new_task
 
 
 def test_safe_env_drops_api_keys():
-    e = safe_env({"PATH": "p", "ANTHROPIC_API_KEY": "k", "OPENAI_API_KEY": "k", "JAVIS_X": "1"}, {"JAVIS_AGENT": "1"})
+    e = safe_env({"PATH": "p", "ANTHROPIC_API_KEY": "k", "OPENAI_API_KEY": "k", "JAVIS_TASK": "T1"}, {"JAVIS_AGENT": "1"})
     assert "ANTHROPIC_API_KEY" not in e and "OPENAI_API_KEY" not in e
-    assert e["JAVIS_AGENT"] == "1" and e["JAVIS_X"] == "1" and e["PATH"] == "p"
+    assert e["JAVIS_AGENT"] == "1" and e["JAVIS_TASK"] == "T1" and e["PATH"] == "p"
 
 
 def test_codex_windows_sandbox_arg(fake_bins, tmp_path, monkeypatch):

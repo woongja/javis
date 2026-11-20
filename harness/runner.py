@@ -25,6 +25,9 @@ ENV_ALLOWLIST = (
     "PATH", "PATHEXT", "HOME", "USERPROFILE", "USERNAME", "USER", "LOGNAME", "APPDATA", "LOCALAPPDATA",
     "PROGRAMDATA", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "TERM",
     "SHELL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CODEX_HOME",
+    # harness's own variables, by name (never a JAVIS_* wildcard: it could carry secrets)
+    "JAVIS_AGENT", "JAVIS_WORKTREE", "JAVIS_TASK", "JAVIS_MERGE", "JAVIS_FAKE_MODE", "JAVIS_FAKE_VERSION",
+    "JAVIS_FAKE_LINK_TARGET",
 )
 _QUOTA = re.compile(r"usage limit|rate limit|quota|too many requests", re.I)
 
@@ -38,7 +41,8 @@ class RunResult:
 
 
 def safe_env(environ: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, str]:
-    env = {k: v for k, v in environ.items() if k in ENV_ALLOWLIST or k.startswith("JAVIS_")}
+    allowed = {k.upper() for k in ENV_ALLOWLIST}
+    env = {k: v for k, v in environ.items() if k.upper() in allowed}
     env.update(extra)
     return env
 

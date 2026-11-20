@@ -23,4 +23,5 @@ def handoff_dir(root: Path, task_id: str) -> Path:
 
 
 def worktree_dir(root: Path, task_id: str) -> Path:
-    return root.parent / "javis-wt" / task_id
+    # Per-repo folder so two clones side by side never share a T001 worktree.
+    return root.parent / f"{root.name}-wt" / task_id

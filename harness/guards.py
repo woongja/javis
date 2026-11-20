@@ -120,17 +120,34 @@ _PATTERNS = [
 ]
 
 
+def _line_finding(line: str) -> str | None:
+    for label, pattern in _PATTERNS:
+        for match in pattern.finditer(line):
+            if label == "email" and _SAFE_EMAIL_DOMAIN.search(match.group(0)):
+                continue
+            return label  # never echo the matched value (it may be a secret)
+    return None
+
+
 def scan_text(text: str) -> list[Finding]:
     findings: list[Finding] = []
     for number, line in enumerate(text.splitlines(), start=1):
         if ALLOW_MARKER in line:
             continue
-        for label, pattern in _PATTERNS:
-            match = pattern.search(line)
-            if not match:
-                continue
-            if label == "email" and _SAFE_EMAIL_DOMAIN.search(match.group(0)):
-                continue
-            findings.append(Finding("R7", number, f"{label}: {match.group(0)[:40]}"))
-            break
+        label = _line_finding(line)
+        if label:
+            findings.append(Finding("R7", number, f"{label} on line {number}"))
     return findings
+
+
+def added_lines(diff_text: str) -> list[str]:
+    """Added content lines of a unified diff, read hunk by hunk (so '++x' content is kept)."""
+    lines, in_hunk = [], False
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("diff --git"):
+            in_hunk = False
+        elif in_hunk and line.startswith("+"):
+            lines.append(line[1:])
+    return lines

@@ -37,24 +37,24 @@ def dispatch(root: Path, task_id: str, role_name: str, timeout_s: int = 1800) ->
     role = load_roles().get(role_name)
     if role is None:
         raise HarnessError(f"unknown role {role_name!r}")
-    task = load(root, task_id)
-    if task.status == "merged":
+    if load(root, task_id).status == "merged":
         raise HarnessError(f"{task_id} is already merged")
-    task = bump_handoff(root, task_id)  # fails fast when the limit is reached
-    wt = _ensure_worktree(root, task)
-    spec = (handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8")
-    env = runner.safe_env(os.environ, {"JAVIS_AGENT": "1", "JAVIS_WORKTREE": str(wt), "JAVIS_TASK": task_id})
-    cmd = runner.build_command(role, wt)
-    log_path = state_dir(root) / "runs" / f"{task_id}-{task.handoffs}.log"
     meta = {"task": task_id, "role": role.name, "tool": role.tool, "model": role.model, "effort": role.effort}
-    with runner.acquire_lock(root, role.tool):
+    # Task lock first (one run per task), then tool lock (one run per tool); only then count the handoff.
+    with runner.acquire_lock(root, f"task-{task_id}"), runner.acquire_lock(root, role.tool):
+        task = bump_handoff(root, task_id)  # fails fast when the limit is reached
+        wt = _ensure_worktree(root, task)
+        spec = (handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8")
+        env = runner.safe_env(os.environ, {"JAVIS_AGENT": "1", "JAVIS_WORKTREE": str(wt), "JAVIS_TASK": task_id})
+        cmd = runner.build_command(role, wt)
+        log_path = state_dir(root) / "runs" / f"{task_id}-{task.handoffs}.log"
         task.status = "running"
         save(root, task)
         ledger.append(root, "dispatch.start", **meta)
         result = runner.run(cmd, PROMPT.format(spec=spec), wt, env, timeout_s, log_path)
     produced = wt / ".task" / "result.md"
-    if produced.exists():
-        shutil.copyfile(produced, handoff_dir(root, task_id) / "result.md")
+    if produced.is_file() and not produced.is_symlink():  # never follow links out of the worktree
+        shutil.copyfile(produced, handoff_dir(root, task_id) / "result.md", follow_symlinks=False)
     if result.quota_hit:
         task.status = "blocked:quota"
     elif result.exit_code == 0 and not result.timed_out:

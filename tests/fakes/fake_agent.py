@@ -19,6 +19,10 @@ if mode == "quota":
 if mode == "slow":
     time.sleep(30)
     sys.exit(0)
+if mode == "symlink":
+    Path(".task").mkdir(exist_ok=True)
+    Path(".task/result.md").symlink_to(os.environ["JAVIS_FAKE_LINK_TARGET"])
+    sys.exit(0)
 if mode == "fail":
     print("boom", file=sys.stderr)
     sys.exit(3)

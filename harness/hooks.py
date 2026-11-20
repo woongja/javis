@@ -9,10 +9,11 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from harness.guards import GuardContext, check_command, check_path, scan_text
+from harness.guards import GuardContext, added_lines, check_command, check_path, scan_text
 from harness.paths import repo_root
 
 _FILE_TOOLS = {"Read": "read", "Write": "write", "Edit": "write", "MultiEdit": "write", "NotebookEdit": "write"}
+_PATH_FIELDS = ("file_path", "notebook_path")
 _SEARCH_TOOLS = {"Grep", "Glob"}
 
 
@@ -20,8 +21,9 @@ def claude_pre(payload: dict, ctx: GuardContext) -> tuple[int, str]:
     tool = payload.get("tool_name", "")
     data = payload.get("tool_input") or {}
     verdict = None
-    if tool in _FILE_TOOLS and data.get("file_path"):
-        verdict = check_path(Path(data["file_path"]), _FILE_TOOLS[tool], ctx)
+    target = next((data[f] for f in _PATH_FIELDS if data.get(f)), None)
+    if tool in _FILE_TOOLS and target:
+        verdict = check_path(Path(target), _FILE_TOOLS[tool], ctx)
     elif tool == "Bash" and data.get("command"):
         verdict = check_command(data["command"], ctx)
     elif tool in _SEARCH_TOOLS and data.get("path"):
@@ -46,12 +48,7 @@ def git_pre_commit(repo: Path, env: Mapping[str, str]) -> tuple[int, str]:
         verdict = check_path(repo / rel, "write", ctx)
         if not verdict.allowed:
             return 1, f"{verdict.rule}: {rel}: {verdict.reason}"
-    added = "\n".join(
-        line[1:]
-        for line in _git(repo, "diff", "--cached", "-U0", "--no-color").splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    )
-    findings = scan_text(added)
+    findings = scan_text("\n".join(added_lines(_git(repo, "diff", "--cached", "-U0", "--no-color"))))
     if findings:
         return 1, "R7: " + "; ".join(f.snippet for f in findings[:5])
     return 0, ""
