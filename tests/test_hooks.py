@@ -1,5 +1,6 @@
 import io
 import json
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +39,13 @@ def test_claude_pre_allows_unknown_tool(ctx):
 def test_claude_pre_allows_normal_edit(ctx):
     payload = {"tool_name": "Edit", "tool_input": {"file_path": str(ctx.repo / "core" / "a.py")}}
     assert claude_pre(payload, ctx) == (0, "")
+
+
+def test_pre_commit_hook_runs_harness_without_sync():
+    hook = Path(__file__).resolve().parents[1] / ".githooks" / "pre-commit"
+    assert "exec uv run --no-sync --quiet harness hook git-pre-commit" in hook.read_text(
+        encoding="utf-8"
+    ).splitlines()
 
 
 def test_pre_commit_blocks_agent(git_repo):

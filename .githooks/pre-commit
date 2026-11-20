@@ -1,2 +1,2 @@
 #!/bin/sh
-exec uv run --quiet harness hook git-pre-commit
+exec uv run --no-sync --quiet harness hook git-pre-commit
