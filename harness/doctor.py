@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from harness.paths import repo_root, state_dir
+from harness import platform
 from harness.platform import find_exe
 from harness.roles import Role, lead_candidates
 from harness.runner import safe_env
@@ -109,7 +110,7 @@ def _probe(role: Role, root: Path) -> bool:
         cmd = [str(exe), "-p", "--model", role.model, "--effort", role.effort, "--setting-sources", "project,local"]
     else:
         cmd = [str(exe), "exec", "-m", role.model, "-c", f'model_reasoning_effort="{role.effort}"',
-               "--ignore-user-config", "-s", "read-only", "-"]
+               "--ignore-user-config", "-s", "read-only", *platform.codex_sandbox_args(), "-"]
     try:
         proc = subprocess.run(cmd, input="Reply with OK", cwd=root, env=safe_env(os.environ, {}), capture_output=True,
                               text=True, encoding="utf-8", errors="replace", timeout=90)

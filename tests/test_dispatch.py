@@ -17,7 +17,17 @@ def test_safe_env_drops_api_keys():
     assert e["JAVIS_AGENT"] == "1" and e["JAVIS_X"] == "1" and e["PATH"] == "p"
 
 
-def test_build_codex_command(fake_bins, tmp_path):
+def test_codex_windows_sandbox_arg(fake_bins, tmp_path, monkeypatch):
+    role = Role("codex.dev", "codex", "gpt-6.2-sol", "medium")
+    monkeypatch.setattr("harness.platform.is_windows", lambda: True)
+    cmd = build_command(role, tmp_path)
+    assert cmd[-3:-1] == ["-c", 'windows.sandbox="elevated"'] and cmd[-1] == "-"
+    monkeypatch.setattr("harness.platform.is_windows", lambda: False)
+    assert 'windows.sandbox="elevated"' not in build_command(role, tmp_path)
+
+
+def test_build_codex_command(fake_bins, tmp_path, monkeypatch):
+    monkeypatch.setattr("harness.platform.is_windows", lambda: False)
     cmd = build_command(Role("codex.dev", "codex", "gpt-6.2-sol", "medium"), tmp_path)
     assert cmd[0] == str(fake_bins["codex"])
     assert cmd[1:] == ["exec", "-m", "gpt-6.2-sol", "-c", 'model_reasoning_effort="medium"',

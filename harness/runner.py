@@ -17,6 +17,7 @@ from pathlib import Path
 
 from harness import HarnessError
 from harness.paths import state_dir
+from harness import platform
 from harness.platform import find_exe, pid_alive
 from harness.roles import Role
 
@@ -50,7 +51,8 @@ def build_command(role: Role, worktree: Path) -> list[str]:
         return [str(exe), "-p", "--model", role.model, "--effort", role.effort,
                 "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
     return [str(exe), "exec", "-m", role.model, "-c", f'model_reasoning_effort="{role.effort}"',
-            "--ignore-user-config", "-C", str(worktree), "-s", "workspace-write", "-"]
+            "--ignore-user-config", "-C", str(worktree), "-s", "workspace-write",
+            *platform.codex_sandbox_args(), "-"]
 
 
 def run(cmd: list[str], prompt: str, cwd: Path, env: dict[str, str], timeout_s: int, log_path: Path) -> RunResult:

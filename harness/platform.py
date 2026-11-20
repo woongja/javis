@@ -11,6 +11,15 @@ def is_windows() -> bool:
     return sys.platform == "win32"
 
 
+def codex_sandbox_args() -> list[str]:
+    """Extra `codex exec` args for this OS.
+
+    `--ignore-user-config` also drops the Windows sandbox setting; without it every
+    command is rejected ("blocked by policy") even under workspace-write (seen 2026-11-20).
+    """
+    return ["-c", 'windows.sandbox="elevated"'] if is_windows() else []
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
