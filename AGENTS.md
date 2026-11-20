@@ -36,6 +36,7 @@ Add a rule only after a real failure, and write why it exists and when it may be
 - Do not commit. Write a short summary (what changed, how you checked) to `.task/result.md`.
 - Stay inside your ownership paths. Ask the lead (via result.md) instead of touching others.
 - Do not invent personal data; never paste real names, paths, or keys into code.
+- Keep test temp files and caches out of the worktree (e.g. point pytest --basetemp at a directory under system temp) because the lead cannot remove sandbox-created artifacts from the worktree.
 
 ## New machine
 ```
