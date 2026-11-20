@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from harness import HarnessError
 
 
-def env_value(root: Path, key: str) -> str | None:
-    """Look up a setting in the process environment, then the repo's .env."""
-    if value := os.environ.get(key):
+def env_value(root: Path, key: str, *, env: Mapping[str, str] | None = None) -> str | None:
+    """Look up a setting in the supplied or process environment, then the repo's .env."""
+    if value := (os.environ if env is None else env).get(key):
         return value
     try:
         lines = (root / ".env").read_text(encoding="utf-8").splitlines()
@@ -24,6 +25,13 @@ def env_value(root: Path, key: str) -> str | None:
             if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
                 value = value[1:-1]
             return value.strip()
+    return None
+
+
+def env_path(root: Path, key: str, *, env: Mapping[str, str] | None = None) -> Path | None:
+    """Resolve a configured path relative to the repository root."""
+    if value := env_value(root, key, env=env):
+        return (root / value).resolve()
     return None
 
 

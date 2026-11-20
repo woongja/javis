@@ -11,7 +11,10 @@ if mode == "version" or "--version" in sys.argv:
 prompt = sys.stdin.read()
 leaked = [k for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if k in os.environ]
 worker = os.environ.get("JAVIS_AGENT", "") + "|" + os.environ.get("JAVIS_WORKTREE", "")
-Path(".fake-args.txt").write_text("\n".join([*sys.argv[1:], f"leaked={leaked}", f"worker={worker}"]), encoding="utf-8")
+brain = os.environ.get("JAVIS_BRAIN_DIR", "")
+Path(".fake-args.txt").write_text(
+    "\n".join([*sys.argv[1:], f"leaked={leaked}", f"worker={worker}", f"brain={brain}"]), encoding="utf-8"
+)
 
 if mode == "quota":
     print("Error: Usage limit reached. Try again later.")

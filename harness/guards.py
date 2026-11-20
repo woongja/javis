@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from harness.paths import env_path
+
 ALLOW_MARKER = "harness:allow"
 
 
@@ -38,12 +40,11 @@ class GuardContext:
 
     @classmethod
     def from_env(cls, repo: Path) -> "GuardContext":
-        brain = os.environ.get("JAVIS_BRAIN_DIR")
         worktree = os.environ.get("JAVIS_WORKTREE")
         return cls(
             repo=repo,
             home=Path.home(),
-            brain_dir=Path(brain) if brain else None,
+            brain_dir=env_path(repo, "JAVIS_BRAIN_DIR"),
             worktree=Path(worktree) if worktree else None,
         )
 

@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from harness.guards import GuardContext, added_lines, check_command, check_path, scan_text
-from harness.paths import repo_root
+from harness.paths import env_path, repo_root
 
 _FILE_TOOLS = {"Read": "read", "Write": "write", "Edit": "write", "MultiEdit": "write", "NotebookEdit": "write"}
 _PATH_FIELDS = ("file_path", "notebook_path")
@@ -43,8 +43,8 @@ def _git(repo: Path, *args: str) -> str:
 def git_pre_commit(repo: Path, env: Mapping[str, str]) -> tuple[int, str]:
     if env.get("JAVIS_AGENT") == "1" and env.get("JAVIS_MERGE") != "1":
         return 1, "R4: workers do not commit; the lead uses `harness merge`"
-    brain = env.get("JAVIS_BRAIN_DIR")
-    ctx = GuardContext(repo=repo, home=Path.home(), brain_dir=Path(brain) if brain else None, worktree=None)
+    brain = env_path(repo, "JAVIS_BRAIN_DIR", env=env)
+    ctx = GuardContext(repo=repo, home=Path.home(), brain_dir=brain, worktree=None)
     for rel in filter(None, _git(repo, "diff", "--cached", "--name-only", "-z").split("\0")):
         verdict = check_path(repo / rel, "write", ctx)
         if not verdict.allowed:

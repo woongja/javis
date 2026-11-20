@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 from harness import HarnessError, ledger, runner
-from harness.paths import handoff_dir, repo_root, state_dir, worktree_dir
+from harness.paths import env_path, handoff_dir, repo_root, state_dir, worktree_dir
 from harness.roles import load_roles
 from harness.tasks import Task, bump_handoff, load, save
 
@@ -45,7 +45,10 @@ def dispatch(root: Path, task_id: str, role_name: str, timeout_s: int = 1800) ->
         task = bump_handoff(root, task_id)  # fails fast when the limit is reached
         wt = _ensure_worktree(root, task)
         spec = (handoff_dir(root, task_id) / "spec.md").read_text(encoding="utf-8")
-        env = runner.safe_env(os.environ, {"JAVIS_AGENT": "1", "JAVIS_WORKTREE": str(wt), "JAVIS_TASK": task_id})
+        worker_env = {"JAVIS_AGENT": "1", "JAVIS_WORKTREE": str(wt), "JAVIS_TASK": task_id}
+        if brain := env_path(root, "JAVIS_BRAIN_DIR"):
+            worker_env["JAVIS_BRAIN_DIR"] = str(brain)
+        env = runner.safe_env(os.environ, worker_env)
         cmd = runner.build_command(role, wt)
         log_path = state_dir(root) / "runs" / f"{task_id}-{task.handoffs}.log"
         task.status = "running"

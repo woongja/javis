@@ -81,12 +81,15 @@ def test_merge_rejects_dirty_main(gated_task):
 def test_merge_archives_handoff(gated_task, tmp_path, monkeypatch, use_process_env):
     root, task_id = gated_task
     dotenv_brain = tmp_path / "dotenv brain"
-    (root / ".env").write_text(f"JAVIS_BRAIN_DIR={dotenv_brain}\n", encoding="utf-8")
+    (root / ".env").write_text("JAVIS_BRAIN_DIR=../dotenv brain\n", encoding="utf-8")
     brain = dotenv_brain
     if use_process_env:
         brain = tmp_path / "process brain"
-        monkeypatch.setenv("JAVIS_BRAIN_DIR", str(brain))
+        monkeypatch.setenv("JAVIS_BRAIN_DIR", "../process brain")
 
+    subdir = root / "subdir"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
     _, warnings = merge(root, task_id)
 
     assert warnings == []

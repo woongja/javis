@@ -72,6 +72,27 @@ def test_dispatch_passes_worker_env(git_repo_with_harness, fake_bins, monkeypatc
     assert f"worker=1|{worktree_dir(root, t.id)}" in args
 
 
+@pytest.mark.parametrize("brain_in_process_env", [False, True])
+def test_dispatch_passes_brain_dir(git_repo_with_harness, fake_bins, monkeypatch, brain_in_process_env):
+    root = git_repo_with_harness
+    dotenv_brain = "../brain from dotenv"
+    (root / ".env").write_text(f"JAVIS_BRAIN_DIR={dotenv_brain}\n", encoding="utf-8")
+    if brain_in_process_env:
+        brain = "../brain from process env"
+        monkeypatch.setenv("JAVIS_BRAIN_DIR", brain)
+    else:
+        brain = dotenv_brain
+        monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+
+    subdir = root / "subdir"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+    task = dispatch(root, new_task(root, "brain guard", "claude").id, "claude.dev")
+    wt = worktree_dir(root, task.id)
+    assert not (wt / ".env").exists()
+    assert f"brain={(root / brain).resolve()}" in (wt / ".fake-args.txt").read_text(encoding="utf-8").splitlines()
+
+
 def test_dispatch_quota(git_repo_with_harness, fake_bins, monkeypatch):
     monkeypatch.setenv("JAVIS_FAKE_MODE", "quota")
     root = git_repo_with_harness

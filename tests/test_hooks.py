@@ -22,6 +22,22 @@ def test_claude_pre_blocks_env(ctx):
     assert code == 2 and msg.startswith("R1")
 
 
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+def test_claude_pre_blocks_brain_read_from_dotenv(git_repo, tmp_path, monkeypatch, relative):
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    monkeypatch.delenv("JAVIS_WORKTREE", raising=False)
+    brain = tmp_path / "brain"
+    value = "../brain" if relative else str(brain)
+    (git_repo / ".env").write_text(f"JAVIS_BRAIN_DIR={value}\n", encoding="utf-8")
+    subdir = git_repo / "subdir"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+    payload = {"tool_name": "Read", "tool_input": {"file_path": str(brain / "note.md")}}
+    ctx = GuardContext.from_env(git_repo)
+    assert ctx.brain_dir == brain.resolve()
+    assert claude_pre(payload, ctx) == (2, "R1: brain vault is off limits")
+
+
 def test_claude_pre_blocks_git_commit(ctx):
     assert claude_pre({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}}, ctx)[0] == 2
 
@@ -68,6 +84,25 @@ def test_pre_commit_blocks_env_file(git_repo):
     run(["git", "add", "-f", ".env"], git_repo)
     code, msg = git_pre_commit(git_repo, {})
     assert code != 0 and "R1" in msg
+
+
+@pytest.mark.parametrize("source", ["absolute-dotenv", "relative-dotenv", "injected-env"])
+def test_pre_commit_blocks_staged_brain_file(git_repo, monkeypatch, source):
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    brain = git_repo / "brain"
+    brain.mkdir()
+    value = str(brain) if source == "absolute-dotenv" else "brain"
+    env = {}
+    if source == "injected-env":
+        env["JAVIS_BRAIN_DIR"] = value
+        value = "other-brain"
+    (git_repo / ".env").write_text(f"JAVIS_BRAIN_DIR={value}\n", encoding="utf-8")
+    (brain / "note.md").write_text("note\n", encoding="utf-8")
+    run(["git", "add", "brain/note.md"], git_repo)
+    subdir = git_repo / "subdir"
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+    assert git_pre_commit(git_repo, env) == (1, "R1: brain/note.md: brain vault is off limits")
 
 
 def test_cli_claude_pre_stdin(git_repo, monkeypatch, capsys):
