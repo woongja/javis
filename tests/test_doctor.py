@@ -92,7 +92,9 @@ def test_brain_dir(git_repo, fake_bins, monkeypatch, capsys, configured, exists,
 
 @pytest.mark.parametrize(("offline_ace", "online_ace", "online_exists", "status"), [
     ("(DENY)(OI)(CI)(R)", "(OI)(CI)(DENY)(RX)", True, "ok"),
-    ("(OI)(CI)(R)", "(OI)(CI)(R)", True, "fail"),
+    ("(OI)(CI)(DENY)(M)", "(OI)(CI)(DENY)(F)", True, "ok"),
+    ("(OI)(CI)(DENY)(RD)", "(DENY)(OI)(CI)(R)", True, "ok"),
+    pytest.param("(OI)(CI)(R)", "(OI)(CI)(R)", True, "fail", id="deny-for-unrelated-account"),
     ("(DENY)(OI)(R)", "(DENY)(OI)(CI)(R)", True, "fail"),
     ("(DENY)(OI)(CI)(IO)(R)", "(DENY)(OI)(CI)(R)", True, "fail"),
     ("(DENY)(OI)(CI)(NP)(R)", "(DENY)(OI)(CI)(R)", True, "fail"),
@@ -112,11 +114,13 @@ def test_windows_brain_isolation(git_repo, fake_bins, monkeypatch, capsys, offli
             accounts = "EXAMPLE\\CodexSandboxOffline\tS-1-5-21-1000\n"
             if online_exists:
                 accounts += "EXAMPLE\\CodexSandboxOnline\tS-1-5-21-1001\n"
-            return subprocess.CompletedProcess(cmd, 0, accounts, "")
+            stdout = accounts.encode("utf-8-sig").decode(kwargs["encoding"])
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
         if cmd[0] == "icacls":
             assert cmd == ["icacls", str(brain.resolve())]
             acl = f"{brain} EXAMPLE\\CodexSandboxOffline:{offline_ace}\n"
             acl += f"    *S-1-5-21-1001:{online_ace}\n"
+            acl += "    EXAMPLE\\UnrelatedAccount:(OI)(CI)(DENY)(R)\n"
             return subprocess.CompletedProcess(cmd, 0, acl, "")
         return native_run(cmd, **kwargs)
 

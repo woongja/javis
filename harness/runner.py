@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from harness import HarnessError
-from harness.paths import env_path, state_dir
+from harness.paths import state_dir
 from harness import platform
 from harness.platform import find_exe, pid_alive
 from harness.roles import Role
@@ -48,19 +48,14 @@ def safe_env(environ: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, 
     return env
 
 
-def build_command(role: Role, worktree: Path) -> list[str]:
+def build_command(role: Role, worktree: Path, brain: Path | None = None) -> list[str]:
     exe = find_exe(role.tool, f"JAVIS_{role.tool.upper()}_BIN")
     if exe is None:
         raise HarnessError(f"{role.tool} not found on PATH (run `harness doctor`)")
     if role.tool == "claude":
         cmd = [str(exe), "-p", "--model", role.model, "--effort", role.effort,
                "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
-        # Dispatch reads configuration from the repo that owns <repo>-wt/<task>.
-        root = worktree
-        parent = worktree.parent
-        if parent.name.endswith("-wt") and (worktree / ".git").is_file():
-            root = parent.parent / parent.name.removesuffix("-wt")
-        if brain := env_path(root, "JAVIS_BRAIN_DIR"):
+        if brain is not None:
             settings = {"sandbox": {"enabled": True, "filesystem": {"denyRead": [str(brain)]}}}
             settings_json = json.dumps(settings)
             if exe.suffix.casefold() in {".cmd", ".bat"}:

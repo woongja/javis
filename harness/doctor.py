@@ -82,7 +82,7 @@ foreach ($name in {names}) {{
 }}
 """
     proc = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                          capture_output=True, encoding="utf-8", env=env, timeout=15, check=True)
+                          capture_output=True, encoding="utf-8-sig", env=env, timeout=15, check=True)
     return dict(line.rsplit("\t", 1) for line in proc.stdout.splitlines() if "\t" in line)
 
 

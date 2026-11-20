@@ -28,27 +28,40 @@ def test_codex_windows_sandbox_arg(fake_bins, tmp_path, monkeypatch):
 
 def test_build_codex_command(fake_bins, tmp_path, monkeypatch):
     monkeypatch.setattr("harness.platform.is_windows", lambda: False)
-    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "example brain"))
-    cmd = build_command(Role("codex.dev", "codex", "gpt-6.2-sol", "medium"), tmp_path)
+    brain = tmp_path / "example brain"
+    cmd = build_command(Role("codex.dev", "codex", "gpt-6.2-sol", "medium"), tmp_path, brain)
     assert cmd[0] == str(fake_bins["codex"])
     assert cmd[1:] == ["exec", "-m", "gpt-6.2-sol", "-c", 'model_reasoning_effort="medium"',
                        "--ignore-user-config", "-C", str(tmp_path), "-s", "workspace-write", "-"]
 
 
 def test_build_claude_command(fake_bins, tmp_path, monkeypatch):
-    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", "example brain")
     cmd = build_command(Role("claude.dev", "claude", "claude-opus-5-5", "medium"), tmp_path)
     assert cmd[1:] == ["-p", "--model", "claude-opus-5-5", "--effort", "medium",
                        "--setting-sources", "project,local", "--permission-mode", "acceptEdits"]
 
 
-def test_build_claude_command_with_brain(fake_bins, tmp_path, monkeypatch):
-    monkeypatch.setenv("JAVIS_BRAIN_DIR", "example brain")
-    cmd = build_command(Role("claude.dev", "claude", "claude-opus-5-5", "medium"), tmp_path)
+def test_build_claude_command_with_brain(fake_bins, tmp_path):
+    brain = tmp_path / "example brain"
+    cmd = build_command(Role("claude.dev", "claude", "claude-opus-5-5", "medium"), tmp_path, brain)
     assert cmd[-2] == "--settings"
     assert json.loads(cmd[-1]) == {
-        "sandbox": {"enabled": True, "filesystem": {"denyRead": [str((tmp_path / "example brain").resolve())]}}
+        "sandbox": {"enabled": True, "filesystem": {"denyRead": [str(brain)]}}
     }
+
+
+@pytest.mark.parametrize("shim", ["x.cmd", "x.bat"])
+def test_build_claude_command_with_brain_and_windows_shim(monkeypatch, tmp_path, shim):
+    monkeypatch.setattr("harness.runner.find_exe", lambda *_: tmp_path / shim)
+    metacharacters = "%&|<>()!^"
+    brain = tmp_path / f"example brain {metacharacters}"
+    cmd = build_command(Role("claude.dev", "claude", "claude-opus-5-5", "medium"), tmp_path, brain)
+    assert cmd[-2] == "--settings"
+    assert json.loads(cmd[-1]) == {
+        "sandbox": {"enabled": True, "filesystem": {"denyRead": [str(brain)]}}
+    }
+    assert not set(metacharacters).intersection(cmd[-1])
 
 
 def test_build_command_missing_exe(monkeypatch, tmp_path):

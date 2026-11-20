@@ -49,7 +49,7 @@ def dispatch(root: Path, task_id: str, role_name: str, timeout_s: int = 1800) ->
         if brain := env_path(root, "JAVIS_BRAIN_DIR"):
             worker_env["JAVIS_BRAIN_DIR"] = str(brain)
         env = runner.safe_env(os.environ, worker_env)
-        cmd = runner.build_command(role, wt)
+        cmd = runner.build_command(role, wt, brain)
         log_path = state_dir(root) / "runs" / f"{task_id}-{task.handoffs}.log"
         task.status = "running"
         save(root, task)
