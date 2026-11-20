@@ -1,5 +1,7 @@
 import json
 import os
+import shlex
+import tomllib
 
 import pytest
 
@@ -17,22 +19,37 @@ def test_safe_env_drops_api_keys():
     assert e["JAVIS_AGENT"] == "1" and e["JAVIS_TASK"] == "T1" and e["PATH"] == "p"
 
 
-def test_codex_windows_sandbox_arg(fake_bins, tmp_path, monkeypatch):
+def test_codex_windows_sandbox_arg(fake_bins, git_repo, monkeypatch):
     role = Role("codex.dev", "codex", "gpt-6.2-sol", "medium")
     monkeypatch.setattr("harness.platform.is_windows", lambda: True)
-    cmd = build_command(role, tmp_path)
+    cmd = build_command(role, git_repo)
     assert cmd[-3:-1] == ["-c", 'windows.sandbox="elevated"'] and cmd[-1] == "-"
     monkeypatch.setattr("harness.platform.is_windows", lambda: False)
-    assert 'windows.sandbox="elevated"' not in build_command(role, tmp_path)
+    assert 'windows.sandbox="elevated"' not in build_command(role, git_repo)
 
 
-def test_build_codex_command(fake_bins, tmp_path, monkeypatch):
-    monkeypatch.setattr("harness.platform.is_windows", lambda: False)
+@pytest.mark.parametrize("windows", [False, True])
+def test_build_codex_command(fake_bins, git_repo, tmp_path, monkeypatch, windows):
+    monkeypatch.setattr("harness.platform.is_windows", lambda: windows)
+    scripts = tmp_path / ("lead's Scripts" if windows else "lead's \"test\" bin")
+    monkeypatch.setattr("harness.runner.sysconfig.get_path", lambda _: str(scripts))
     brain = tmp_path / "example brain"
-    cmd = build_command(Role("codex.dev", "codex", "gpt-6.2-sol", "medium"), tmp_path, brain)
+    repo = git_repo.rename(tmp_path / "lead's project")
+    cmd = build_command(Role("codex.dev", "codex", "gpt-6.2-sol", "medium"), repo, brain)
     assert cmd[0] == str(fake_bins["codex"])
-    assert cmd[1:] == ["exec", "-m", "gpt-6.2-sol", "-c", 'model_reasoning_effort="medium"',
-                       "--ignore-user-config", "-C", str(tmp_path), "-s", "workspace-write", "-"]
+    assert cmd[1:11] == ["exec", "-m", "gpt-6.2-sol", "-c", 'model_reasoning_effort="medium"',
+                         "--ignore-user-config", "-C", str(repo), "-s", "workspace-write"]
+    assert "--dangerously-bypass-hook-trust" in cmd and cmd[-1] == "-"
+    config = next(value for flag, value in zip(cmd, cmd[1:])
+                  if flag == "-c" and value.startswith("hooks.PreToolUse="))
+    group, = tomllib.loads("x = " + config.split("=", 1)[1])["x"]
+    hook, = group["hooks"]
+    assert group["matcher"] == ".*" and hook["type"] == "command" and hook["timeout"] == 30
+    if windows:
+        expected = f"& '{scripts / 'harness.exe'}' hook codex-pre --repo '{repo}'"
+        assert hook["command"] == expected.replace("lead's", "lead''s")
+    else:
+        assert shlex.split(hook["command"]) == [str(scripts / "harness"), "hook", "codex-pre", "--repo", str(repo)]
 
 
 def test_build_claude_command(fake_bins, tmp_path, monkeypatch):
@@ -81,7 +98,12 @@ def test_dispatch_ok(git_repo_with_harness, fake_bins):
     t = dispatch(root, t.id, "codex.dev")
     assert t.status == "done" and t.handoffs == 1
     assert (handoff_dir(root, t.id) / "result.md").read_text(encoding="utf-8").startswith("done")
-    assert (worktree_dir(root, t.id) / "hud" / "demo.txt").exists()
+    wt = worktree_dir(root, t.id)
+    assert (wt / "hud" / "demo.txt").exists()
+    args = (wt / ".fake-args.txt").read_text(encoding="utf-8").splitlines()
+    config = next(arg for arg in args if arg.startswith("hooks.PreToolUse="))
+    hook = tomllib.loads(config)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert hook.endswith(f"hook codex-pre --repo '{root}'")
     end = [e for e in _events(root) if e["event"] == "dispatch.end"][0]
     assert end["model"] == "gpt-6.2-sol" and end["exit"] == 0 and end["role"] == "codex.dev"
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
+import sysconfig
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -63,8 +65,22 @@ def build_command(role: Role, worktree: Path, brain: Path | None = None) -> list
                 settings_json = re.sub(r"[%!^&|<>()]", lambda m: f"\\u{ord(m[0]):04x}", settings_json)
             cmd.extend(["--settings", settings_json])
         return cmd
+    scripts = Path(sysconfig.get_path("scripts")).absolute()
+    listing = subprocess.check_output(["git", "worktree", "list", "--porcelain", "-z"], cwd=worktree)
+    repo = str(Path(listing.decode("utf-8").split("\0", 1)[0].removeprefix("worktree ")))
+    if platform.is_windows():
+        launcher = str(scripts / "harness.exe").replace("'", "''")
+        quoted_repo = repo.replace("'", "''")
+        hook = f"& '{launcher}' hook codex-pre --repo '{quoted_repo}'"
+    else:
+        hook = shlex.join([str(scripts / "harness"), "hook", "codex-pre", "--repo", repo])
+    hook_toml = json.dumps(hook, ensure_ascii=False)
+    if exe.suffix.casefold() in {".cmd", ".bat"}:
+        hook_toml = re.sub(r"[%!^&|<>()]", lambda m: f"\\u{ord(m[0]):04x}", hook_toml)
+    config = f"hooks.PreToolUse=[{{matcher='.*',hooks=[{{type='command',command={hook_toml},timeout=30}}]}}]"
     return [str(exe), "exec", "-m", role.model, "-c", f'model_reasoning_effort="{role.effort}"',
             "--ignore-user-config", "-C", str(worktree), "-s", "workspace-write",
+            "--dangerously-bypass-hook-trust", "-c", config,
             *platform.codex_sandbox_args(), "-"]
 
 

@@ -1,4 +1,4 @@
-"""Hook entry points: Claude Code PreToolUse, git pre-commit, CI scan."""
+"""Hook entry points: Claude and Codex PreToolUse, git pre-commit, CI scan."""
 from __future__ import annotations
 
 import argparse
@@ -9,13 +9,14 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from harness.guards import GuardContext, added_lines, check_command, check_path, scan_text
+from harness.guards import GuardContext, added_lines, check_command, check_command_paths, check_path, scan_text
 from harness.paths import env_path, repo_root
 
 _FILE_TOOLS = {"Read": "read", "Write": "write", "Edit": "write", "MultiEdit": "write", "NotebookEdit": "write"}
 _PATH_FIELDS = ("file_path", "notebook_path")
 _SEARCH_TOOLS = {"Grep", "Glob"}
 _SHELL_TOOLS = {"Bash", "PowerShell"}
+_PATCH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
 
 
 def claude_pre(payload: dict, ctx: GuardContext) -> tuple[int, str]:
@@ -27,11 +28,37 @@ def claude_pre(payload: dict, ctx: GuardContext) -> tuple[int, str]:
         verdict = check_path(Path(target), _FILE_TOOLS[tool], ctx)
     elif tool in _SHELL_TOOLS and data.get("command"):
         verdict = check_command(data["command"], ctx)
+        if verdict.allowed:
+            verdict = check_command_paths(data["command"], ctx, Path(payload.get("cwd") or ctx.worktree or ctx.repo))
     elif tool in _SEARCH_TOOLS and data.get("path"):
         verdict = check_path(Path(data["path"]), "read", ctx)
     if verdict is None or verdict.allowed:
         return 0, ""
     return 2, f"{verdict.rule}: {verdict.reason}"
+
+
+def codex_pre(payload: dict, ctx: GuardContext) -> tuple[bool, str]:
+    if not isinstance(payload, dict) or not isinstance(tool := payload.get("tool_name"), str):
+        raise ValueError("expected a hook payload with a tool name")
+    if tool not in {"Bash", "apply_patch"}:
+        return True, ""
+    data = payload.get("tool_input")
+    if not isinstance(data, dict) or not isinstance(command := data.get("command"), str):
+        raise ValueError("expected a tool input with a command string")
+    cwd = Path(payload.get("cwd", ctx.worktree or ctx.repo))
+    if tool == "Bash":
+        verdict = check_command(command, ctx)
+        if verdict.allowed:
+            verdict = check_command_paths(command, ctx, cwd)
+        if not verdict.allowed:
+            return False, f"{verdict.rule}: {verdict.reason}"
+    else:
+        for line in command.splitlines():
+            if line.startswith(_PATCH_HEADERS):
+                verdict = check_path(cwd / line.split(": ", 1)[1].strip(), "write", ctx)
+                if not verdict.allowed:
+                    return False, f"{verdict.rule}: {verdict.reason}"
+    return True, ""
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -109,6 +136,25 @@ def _cmd_git_pre_commit(args: argparse.Namespace) -> int:
     return code
 
 
+def _cmd_codex_pre(args: argparse.Namespace) -> int:
+    try:
+        try:
+            payload = json.load(getattr(sys.stdin, "buffer", sys.stdin))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return 0
+        worktree = Path(value) if (value := os.environ.get("JAVIS_WORKTREE")) else None
+        brain = os.environ.get("JAVIS_BRAIN_DIR")
+        ctx = GuardContext(args.repo or repo_root(), Path.home(), Path(brain) if brain else None, worktree)
+        allowed, message = codex_pre(payload, ctx)
+    except Exception:
+        allowed, message = False, "R1: hook error, fail closed"
+    if not allowed:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                               "permissionDecision": "deny",
+                                               "permissionDecisionReason": message}}))
+    return 0
+
+
 def _cmd_scan_all(args: argparse.Namespace) -> int:
     repo = repo_root()
     problems = scan_history(repo) if args.history else scan_all(repo)
@@ -121,6 +167,9 @@ def register(subparsers) -> None:
     hook = subparsers.add_parser("hook", help="hook entry points (called by tools, not people)")
     sub = hook.add_subparsers(dest="hook", required=True)
     sub.add_parser("claude-pre").set_defaults(func=_cmd_claude_pre)
+    codex = sub.add_parser("codex-pre")
+    codex.add_argument("--repo", type=Path, help="lead repository root")
+    codex.set_defaults(func=_cmd_codex_pre)
     sub.add_parser("git-pre-commit").set_defaults(func=_cmd_git_pre_commit)
     scan = sub.add_parser("scan-all")
     scan.add_argument("--history", action="store_true", help="scan added lines across all Git refs")

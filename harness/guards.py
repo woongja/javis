@@ -82,7 +82,7 @@ def _is_agent_memory(target: Path, home: Path) -> bool:
 
 def check_path(path: Path, op: Literal["read", "write"], ctx: GuardContext) -> Verdict:
     target = _absolute(Path(path), ctx)
-    name = target.name.casefold()
+    name = target.name.rstrip(" .").casefold()
     if (name == ".env" or name.startswith(".env.")) and name != ".env.example":
         return Verdict(False, "R1", f"{target.name} holds secrets")
     if ctx.worktree is None and _is_agent_memory(target, ctx.home):
@@ -121,6 +121,18 @@ def check_command(cmd: str, ctx: GuardContext) -> Verdict:
     for pattern in _GIT_FORBIDDEN:
         if pattern.search(cmd):
             return Verdict(False, "R4", "only `harness merge` may commit/push/merge")
+    return _OK
+
+
+def check_command_paths(cmd: str, ctx: GuardContext, cwd: Path) -> Verdict:
+    # Token checks are heuristic; OS ACLs are the primary defense.
+    for match in re.finditer(r'''"[^"]*"|'[^']*'|[^\s"';&|<>]+''', cmd):
+        path = Path(match.group().strip("\"'"))
+        if path.parts[:1] == ("~",):
+            path = ctx.home.joinpath(*path.parts[1:])
+        verdict = check_path(cwd / path, "read", ctx)
+        if not verdict.allowed:
+            return verdict
     return _OK
 
 
