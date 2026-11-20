@@ -9,10 +9,13 @@ def test_find_exe_override(tmp_path, monkeypatch):
     assert find_exe("claude", "JAVIS_CLAUDE_BIN") == fake
 
 
-def test_find_exe_uses_which(monkeypatch):
+def test_find_exe_uses_which(tmp_path, monkeypatch):
+    shim = tmp_path / "npm" / "codex.CMD"
     monkeypatch.delenv("JAVIS_CODEX_BIN", raising=False)
-    monkeypatch.setattr("shutil.which", lambda n: r"C:\npm\codex.CMD")
-    assert find_exe("codex", "JAVIS_CODEX_BIN").name.lower() == "codex.cmd"
+    monkeypatch.setattr("shutil.which", lambda n: str(shim))
+    found = find_exe("codex", "JAVIS_CODEX_BIN")
+    assert found == shim
+    assert found.suffix == ".CMD"
 
 
 def test_find_exe_missing(monkeypatch):
