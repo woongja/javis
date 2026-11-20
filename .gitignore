@@ -1,0 +1,10 @@
+.env
+.harness/
+.handoff/
+.task/
+.superpowers/
+.claude/settings.local.json
+__pycache__/
+.venv/
+*.egg-info/
+.omc/

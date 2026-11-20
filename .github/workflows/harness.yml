@@ -1,0 +1,24 @@
+name: harness
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+      - name: Tests
+        run: uv run pytest -q
+      - name: Secret and personal-data scan
+        run: uv run harness hook scan-all
