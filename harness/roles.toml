@@ -1,0 +1,52 @@
+# Role table — the single source of truth for who runs with which model/effort.
+# Change models here only. `harness doctor --probe` picks the first usable lead.
+
+[lead]
+candidates = [
+  { tool = "claude", model = "claude-fable-5-2", effort = "high" },
+  { tool = "codex",  model = "gpt-6.2-astra",    effort = "high" },  # when Fable is unavailable
+]
+
+[claude.dev_hard]
+tool = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[claude.dev]
+tool = "claude"
+model = "claude-opus-5-5"
+effort = "medium"
+
+[claude.simple]
+tool = "claude"
+model = "claude-sonnet-5-5"
+effort = "low"
+
+[claude.reviewer]   # reviews Codex-written code
+tool = "claude"
+model = "claude-opus-5-5"
+effort = "medium"
+
+[codex.dev]
+tool = "codex"
+model = "gpt-6.2-sol"
+effort = "medium"
+
+[codex.dev_hard]
+tool = "codex"
+model = "gpt-6.2-astra"
+effort = "high"
+
+[codex.visual]      # screen comparison
+tool = "codex"
+model = "gpt-6.2-sol"
+effort = "low"
+
+[codex.reviewer]    # reviews Claude-written code
+tool = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
+
+[ownership]
+claude = ["core/", "brain/", "security/", "channels/telegram/"]
+codex = ["hud/", "worklog/", "workshop/", "teams/"]
