@@ -1,9 +1,14 @@
 """Command-line interface for the local javis gateway."""
 
 import argparse
+import os
 import sqlite3
 import sys
+from pathlib import Path
 
+from channels.telegram.bot import TelegramBot, TelegramError
+from harness import HarnessError
+from harness.paths import env_value, repo_root
 from worklog.store import Store
 
 from .config import data_dir, load_settings
@@ -22,6 +27,34 @@ def _count(value: str) -> int:
     return count
 
 
+def _telegram_settings() -> tuple[str, int] | None:
+    checkout = Path(__file__).resolve().parents[1]
+    if not (checkout / ".git").exists():
+        try:
+            checkout = repo_root()
+        except HarnessError:
+            checkout = None
+    values = []
+    for name in ("JAVIS_TELEGRAM_TOKEN", "JAVIS_TELEGRAM_CHAT_ID"):
+        value = os.environ.get(name, "").strip()
+        if not value and checkout is not None:
+            try:
+                value = env_value(checkout, name, env={}) or ""
+            except (OSError, ValueError):
+                pass
+        values.append(value)
+
+    token, chat = values
+    try:
+        chat_id = int(chat)
+    except ValueError:
+        print("JAVIS_TELEGRAM_CHAT_ID", file=sys.stderr)
+        chat_id = None
+    if not token:
+        print("JAVIS_TELEGRAM_TOKEN", file=sys.stderr)
+    return (token, chat_id) if token and chat_id is not None else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="javis", description="Ask javis and view the local worklog.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -29,9 +62,18 @@ def main(argv: list[str] | None = None) -> int:
     ask.add_argument("text")
     log = commands.add_parser("log", help="Show recent worklog entries")
     log.add_argument("-n", metavar="N", type=_count, default=20)
+    commands.add_parser("serve", help="Serve requests from Telegram")
     args = parser.parse_args(argv)
     if args.command == "ask" and not args.text.strip():
         ask.error("text must not be empty")
+
+    if args.command == "serve":
+        try:
+            telegram = _telegram_settings()
+        except KeyboardInterrupt:
+            return 0
+        if telegram is None:
+            return 1
 
     try:
         directory = data_dir()
@@ -42,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if args.command == "ask":
+    if args.command in ("ask", "serve"):
         try:
             settings = load_settings()
         except (OSError, ValueError):
@@ -51,6 +93,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         store = Store.open(directory)
+        if args.command == "serve":
+            try:
+                token, chat_id = telegram
+                TelegramBot(token, chat_id, store, ClaudeEngine(settings)).run()
+            except TelegramError as error:
+                print(f"Telegram {error.code}", file=sys.stderr)
+                return 1
+            except KeyboardInterrupt:
+                return 0
+            return 0
         if args.command == "log":
             for record in store.recent(args.n):
                 print(f"{record.id}\t{record.created_at}\t{question_preview(record.request)}\t{record.status}")
