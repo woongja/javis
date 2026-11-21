@@ -63,7 +63,9 @@ print(json.dumps({envelope!r}))
         "--tools": "WebSearch", "--allowedTools": "WebSearch", "--model": "claude-sonnet-5-5",
     }.items():
         assert argv[argv.index(flag) + 1] == value
-    assert '{"items":' in argv[argv.index("--system-prompt") + 1]
+    prompt = argv[argv.index("--system-prompt") + 1]
+    assert '{"items":' in prompt
+    assert "Do not prefix item text with numbers or list markers." in prompt
     assert "PATH" in recorded["env"]
     assert {"ANTHROPIC_API_KEY", "JAVIS_TELEGRAM_TOKEN", "TELEGRAM_TOKEN", "JAVIS_DATA_DIR"}.isdisjoint(recorded["env"])
 

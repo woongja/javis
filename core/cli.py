@@ -4,6 +4,7 @@ import argparse
 import os
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from channels.telegram.bot import TelegramBot, TelegramError
@@ -105,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "log":
             for record in store.recent(args.n):
-                print(f"{record.id}\t{record.created_at}\t{question_preview(record.request)}\t{record.status}")
+                local_time = datetime.fromisoformat(record.created_at).astimezone()
+                print(f"{record.id}\t{local_time:%Y-%m-%d %H:%M}\t{question_preview(record.request)}\t{record.status}")
             return 0
         reply = handle(Request("cli", args.text), store, ClaudeEngine(settings))
         saved = store.get(reply.record_id)

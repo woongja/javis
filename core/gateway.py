@@ -1,5 +1,6 @@
 """Shared request, persistence and reply formatting for channel adapters."""
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -8,6 +9,8 @@ from worklog.store import Item, Record, Store
 from .engine import Engine
 from .recall import recall
 
+_NUMBER_PREFIX = re.compile(r"^(?:\*\*[0-9]{1,2}[.)]\*\*|(\*\*)?[0-9]{1,2}[.)])[ \t]+")
+_TITLE_LIMIT = 80
 _FAILURES = {
     "timeout": "엔진 제한 시간이 지났습니다.",
     "quota": "엔진 사용 한도에 도달했습니다.",
@@ -30,11 +33,26 @@ class Reply:
     record_id: int
 
 
+def _title_preview(text: str) -> str:
+    title = (text.splitlines() or [""])[0]
+    if len(title) <= _TITLE_LIMIT:
+        return title
+    preview = title[:_TITLE_LIMIT - 1].rstrip(" *")
+    if preview.count("**") % 2:
+        before_bold, _, bold_text = preview.rpartition("**")
+        available = _TITLE_LIMIT - len(before_bold) - len("**…**")
+        if available > 0:
+            return f"{before_bold}**{bold_text[:available].rstrip()}…**"
+        return before_bold.rstrip() + "…"
+    return preview + "…"
+
+
 def _render(items: tuple[Item, ...], *, sources_only: bool = False, start: int = 1) -> str:
     lines = []
     for number, item in enumerate(items, start):
-        label = f"{number}." if sources_only else f"{number}. {item.text}"
-        lines.append(label)
+        text = _NUMBER_PREFIX.sub(r"\1", item.text)
+        label = _title_preview(text) if sources_only else text
+        lines.append(f"{number}. {label}")
         lines.extend(f"   {source}" for source in item.sources or ("기록된 출처 없음",))
     return "\n".join(lines)
 

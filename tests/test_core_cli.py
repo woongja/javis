@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from core import cli
@@ -9,19 +10,39 @@ from tests.test_core_engine import fake_claude, success
 
 def test_ask_stores_and_log_lists_answer(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path / "data"))
-    envelope = success([{"text": "답변", "sources": ["https://example.org/news"]}])
+    texts = ["1. A", "**1. A** – b", "1) A", "답변", "2026년 뉴스", "2026. 11. 21. Anthropic 발표"]
+    envelope = success([{"text": text, "sources": ["https://example.org/news"]} for text in texts])
     shim = fake_claude(tmp_path, f"print(json.dumps({envelope!r}))\n")
     # The same injection point used by the engine tests, through the real CLI.
     engine_class = cli.ClaudeEngine
     monkeypatch.setattr(cli, "ClaudeEngine", lambda settings: engine_class(settings, shim))
+    now = datetime(2026, 11, 21, 16, 41, 49, 316525, tzinfo=UTC)
+    handle = cli.handle
+    monkeypatch.setattr(cli, "handle", lambda request, store, engine: handle(request, store, engine, now))
     assert cli.main(["ask", "오늘 뉴스"]) == 0
     out = capsys.readouterr().out
     [record] = Store.open(tmp_path / "data").recent(10)
-    assert "1. 답변" in out and "https://example.org/news" in out and f"기록 ID {record.id}" in out
+    assert out.splitlines()[:12:2] == [
+        "1. A",
+        "2. **A** – b",
+        "3. A",
+        "4. 답변",
+        "5. 2026년 뉴스",
+        "6. 2026. 11. 21. Anthropic 발표",
+    ]
+    assert "https://example.org/news" in out and f"기록 ID {record.id}" in out
+    assert [item.text for item in record.items] == texts
     assert (record.channel, record.status, record.model) == ("cli", "ok", "claude-sonnet-5-5")
 
+    class LocalDateTime(datetime):
+        def astimezone(self, tz=None):
+            assert tz is None
+            return super().astimezone(timezone(timedelta(hours=9)))
+
+    monkeypatch.setattr(cli, "datetime", LocalDateTime)
     assert cli.main(["log", "-n", "1"]) == 0
-    assert capsys.readouterr().out.splitlines() == [f"{record.id}\t{record.created_at}\t오늘 뉴스\tok"]
+    assert capsys.readouterr().out.splitlines() == [f"{record.id}\t2026-11-22 01:41\t오늘 뉴스\tok"]
+    assert Store.open(tmp_path / "data").get(record.id).created_at == now.isoformat()
     assert cli.main(["log", "-n", "0"]) == 0
     assert not capsys.readouterr().out
 

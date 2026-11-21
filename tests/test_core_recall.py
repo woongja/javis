@@ -14,8 +14,8 @@ YESTERDAY = datetime(2026, 11, 21, 0, 10, tzinfo=KST)
 TODAY = datetime(2026, 11, 22, 0, 30, tzinfo=KST)
 NEWS = (
     Item("첫 뉴스", ("https://example.org/one",)),
-    Item("두 번째 뉴스", ("https://example.org/two",)),
-    Item("세 번째 뉴스", ()),
+    Item("2. 두 번째 뉴스\n상세 내용", ("https://example.org/two",)),
+    Item("**3. " + "긴" * 90 + "**", ()),
 )
 
 
@@ -33,7 +33,7 @@ def test_yesterday_recall_in_fresh_cli_process(tmp_path, monkeypatch):
     monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
     store = Store.open(tmp_path)
     answer = handle(Request("telegram", "Claude 뉴스 3개"), store, NewsEngine(), YESTERDAY)
-    displayed_url = answer.text.splitlines()[3].strip()
+    displayed_url = answer.text.splitlines()[4].strip()
     assert displayed_url == NEWS[1].sources[0]
     assert datetime.fromisoformat(store.get(answer.record_id).created_at).tzinfo == UTC
     # Freeze the clock and replace the engine only in the new CLI process.
@@ -57,7 +57,7 @@ cli.ClaudeEngine = lambda settings: NoEngine()
         [*command, "ask", "어제 두 번째 뉴스 출처 뭐였지?"],
         cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", check=True,
     )
-    assert process.stdout.splitlines()[:2] == ["2.", f"   {displayed_url}"]
+    assert process.stdout.splitlines()[:2] == ["2. 두 번째 뉴스", f"   {displayed_url}"]
     saved = store.recent(1)[0]
     assert (saved.kind, saved.ref_id, saved.items, saved.engine) == ("recall", answer.record_id, (NEWS[1],), None)
 
@@ -73,8 +73,8 @@ def test_explicit_old_id_missing_number_and_repeated_recall(tmp_path):
         return handle(Request("cli", text), store, NoEngine(), TODAY)
 
     explicit = ask(f"출처 {original.record_id}")
-    assert "1.\n   https://example.org/one" in explicit.text
-    assert "3.\n   기록된 출처 없음" in explicit.text
+    assert "1. 첫 뉴스\n   https://example.org/one" in explicit.text
+    assert f"3. **{'긴' * 75}…**\n   기록된 출처 없음" in explicit.text
     assert "항목 번호가 없습니다" in ask(f"출처 {original.record_id} 4").text
     assert "기록을 찾지 못했습니다" in ask("출처 9999999999999999999 1").text
     assert "<기록ID>" in ask("그거 출처 다시").text
@@ -83,7 +83,7 @@ def test_explicit_old_id_missing_number_and_repeated_recall(tmp_path):
     for _ in range(2):
         latest = ask("방금 2번 출처")
         assert store.get(latest.record_id).ref_id == latest_original.id
-        assert latest.text.startswith("2.\n   https://example.org/two")
+        assert latest.text.startswith("2. 두 번째 뉴스\n   https://example.org/two")
 
 
 def test_yesterday_candidates_and_missing_date(tmp_path):
