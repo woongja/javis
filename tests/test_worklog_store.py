@@ -1,0 +1,204 @@
+import sqlite3
+import subprocess
+import sys
+from contextlib import closing
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from worklog import Item, Record, Store
+
+
+SAMPLE = Record(
+    id=None,
+    created_at="2026-11-21T00:00:00Z",
+    channel="cli",
+    kind="ask",
+    request="What did the release change?",
+    items=(
+        Item("Summary", ("https://example.org/release", "https://example.org/notes")),
+        Item("Follow-up", ()),
+    ),
+    status="ok",
+    reason=None,
+    engine="example",
+    model="example-model",
+    duration_s=1.25,
+    ref_id=None,
+    update_key=None,
+)
+
+READER = """
+import sys
+from dataclasses import replace
+from pathlib import Path
+from tests.test_worklog_store import SAMPLE
+from worklog import Store
+
+record_id = int(sys.argv[2])
+store = Store.open(Path(sys.argv[1]))
+assert store.get(record_id) == replace(SAMPLE, id=record_id)
+"""
+
+WRITER = """
+import sys
+from dataclasses import replace
+from pathlib import Path
+from tests.test_worklog_store import SAMPLE
+from worklog import Store
+
+sys.stdin.readline()
+store = Store.open(Path(sys.argv[1]))
+writer = int(sys.argv[2])
+for number in range(50):
+    store.save(replace(SAMPLE, request=f"{writer}/{number}"))
+"""
+
+
+def test_round_trip_across_processes(tmp_path):
+    data_dir = tmp_path / "nested" / "data"
+    store = Store.open(data_dir)
+    assert store.recent(10) == []
+    assert store.get(1) is None
+    assert store.last_ok_ask() is None
+    assert store.get_offset() is None
+
+    record_id = store.save(SAMPLE)
+    assert store.get(record_id) == replace(SAMPLE, id=record_id)
+    subprocess.run(
+        [sys.executable, "-c", READER, str(data_dir), str(record_id)],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        timeout=15,
+    )
+
+
+def test_two_concurrent_processes_each_save_fifty_records(tmp_path):
+    data_dir = tmp_path / "shared"
+    processes = []
+    try:
+        for writer in range(2):
+            processes.append(subprocess.Popen(
+                [sys.executable, "-c", WRITER, str(data_dir), str(writer)],
+                cwd=Path(__file__).resolve().parents[1],
+                stdin=subprocess.PIPE,
+            ))
+        for process in processes:
+            process.stdin.write(b"start\n")
+            process.stdin.close()
+        for process in processes:
+            assert process.wait(timeout=30) == 0
+    finally:
+        for process in processes:
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+    records = Store.open(data_dir).recent(101)
+    assert len(records) == 100
+    assert len({record.id for record in records}) == 100
+    assert {record.request for record in records} == {
+        f"{writer}/{number}" for writer in range(2) for number in range(50)
+    }
+    for record in records:
+        assert record == replace(SAMPLE, id=record.id, request=record.request)
+
+
+def test_update_key_deduplicates_without_replacing_record(tmp_path):
+    store = Store.open(tmp_path)
+    first = replace(SAMPLE, channel="telegram", update_key="42:1795219200")
+    record_id = store.save(first, chunks=["first reply"])
+    store.mark_sent(record_id, 1)
+    assert store.save(replace(first, request="duplicate"), chunks=["new reply"]) == record_id
+    assert store.recent(10) == [replace(first, id=record_id)]
+    assert store.by_update_key(first.update_key) == replace(first, id=record_id)
+    assert store.pending_deliveries() == []
+
+    later = replace(first, update_key="42:1795910400")
+    later_id = store.save(later)
+    assert later_id != record_id
+    assert store.by_update_key(later.update_key) == replace(later, id=later_id)
+    assert store.by_update_key("42") is None
+    assert [record.id for record in store.recent(2)] == [later_id, record_id]
+
+
+def test_successful_ask_queries_use_timestamp_order_and_local_dates(tmp_path):
+    store = Store.open(tmp_path)
+    utc_plus_nine = timezone(timedelta(hours=9))
+    day = date(2026, 11, 22)
+    end = store.save(replace(SAMPLE, created_at="2026-11-22T14:59:59.999999Z"))
+    before = store.save(replace(SAMPLE, created_at="2026-11-21T14:59:59.999999Z"))
+    start = store.save(replace(SAMPLE, created_at="2026-11-21T15:00:00+00:00"))
+    same_second = store.save(replace(SAMPLE, created_at="2026-11-21T15:00:00.1Z"))
+    recall = store.save(replace(
+        SAMPLE, created_at="2026-11-22T14:59:59.999999Z", kind="recall",
+        engine=None, model=None, duration_s=None, ref_id=end,
+    ))
+    failed = store.save(replace(
+        SAMPLE, created_at="2026-11-22T14:59:59.999999Z", status="timeout",
+        reason="timeout", items=(),
+    ))
+    assert store.last_ok_ask().id == end
+    assert store.get(recall).ref_id == end
+    assert store.get(failed).items == ()
+    assert [record.id for record in store.ok_asks_on(day, utc_plus_nine)] == [
+        start, same_second, end,
+    ]
+
+    after = store.save(replace(SAMPLE, created_at="2026-11-22T15:00:00Z"))
+    assert [record.id for record in store.ok_asks_on(day, utc_plus_nine)] == [
+        start, same_second, end,
+    ]
+    assert [record.id for record in store.recent(7)] == [
+        after, failed, recall, end, same_second, start, before,
+    ]
+
+
+def test_delivery_progress_and_cursor_commit_together(tmp_path):
+    store = Store.open(tmp_path)
+    record_id = store.save(SAMPLE)
+    chunks = ["first", "second"]
+    store.set_delivery(record_id, chunks)
+    store.set_offset(20)
+    assert store.pending_deliveries() == [(record_id, chunks, 0)]
+    store.mark_sent(record_id, 1)
+    assert store.pending_deliveries() == [(record_id, chunks, 1)]
+    original_cursor = store.get_offset()
+    assert original_cursor[0] == 20
+
+    with pytest.raises(OverflowError):
+        store.mark_sent(record_id, 2, offset=2**63)
+    assert store.get_offset() == original_cursor
+    assert store.pending_deliveries() == [(record_id, chunks, 1)]
+
+    store.mark_sent(record_id, 2, offset=21)
+    reopened = Store.open(tmp_path)
+    assert reopened.pending_deliveries() == []
+    offset, updated_at = reopened.get_offset()
+    assert offset == 21
+    assert datetime.fromisoformat(updated_at).tzinfo == UTC
+
+
+def test_delivery_save_and_permanent_failure_are_atomic(tmp_path):
+    store = Store.open(tmp_path)
+    with pytest.raises(TypeError):
+        store.save(SAMPLE, chunks=[object()])
+    assert store.recent(10) == []
+
+    record_id = store.save(SAMPLE, chunks=["reply"])
+    assert store.pending_deliveries() == [(record_id, ["reply"], 0)]
+    with pytest.raises(OverflowError):
+        store.mark_failed(record_id, "forbidden", offset=2**63)
+    assert store.pending_deliveries() == [(record_id, ["reply"], 0)]
+
+    store.mark_failed(record_id, "forbidden", offset=10)
+    assert store.pending_deliveries() == []
+    assert store.get_offset()[0] == 10
+    with closing(sqlite3.connect(tmp_path / "javis.db")) as db:
+        assert db.execute(
+            "SELECT failure_reason FROM deliveries WHERE record_id = ?", (record_id,)
+        ).fetchone() == ("forbidden",)
