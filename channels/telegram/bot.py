@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import logging
 import random
 import re
 import time
@@ -11,16 +12,27 @@ from datetime import UTC, datetime, timedelta
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request as HTTPRequest, build_opener
+from uuid import uuid4
 
 from core.approval import ApprovalService, Executor
 from core.engine import Engine
 from core.gateway import Request, handle
 from core.note import NOTE_EXECUTORS
+from core.voice import Audio, voice_for
 from worklog.store import ApprovalKind, Record, Store
 
 _API_BASE = "https://api.telegram.org"
 _POLL_TIMEOUT = 25
 _HTTP_TIMEOUT = 35
+_MAX_VOICE_UPLOAD = 20 * 1024 * 1024
+# Use sendVoice for OGG/Opus and attach other provider formats as documents.
+_VOICE_FILES = {
+    "audio/ogg": ("sendVoice", "voice", "reply.ogg"),
+    "audio/mpeg": ("sendDocument", "document", "reply.mp3"),
+    "audio/wav": ("sendDocument", "document", "reply.wav"),
+    "audio/aiff": ("sendDocument", "document", "reply.aiff"),
+}
+_LOG = logging.getLogger(__name__)
 _CURSOR_LIFETIME = timedelta(days=1)
 _CHUNK_LIMIT = 4000
 # The gateway formats the footer before the real SQLite ID is available.
@@ -118,10 +130,13 @@ class TelegramBot:
         self._cursor = (saved[0], datetime.fromisoformat(saved[1])) if saved else None
 
     def _response(self, method: str, payload: dict) -> tuple[int, dict]:
+        return self._post(method, json.dumps(payload).encode("ascii"), "application/json")
+
+    def _post(self, method: str, data: bytes, content_type: str) -> tuple[int, dict]:
         request = HTTPRequest(
             f"{self._api_base}/bot{quote(self._token, safe=':')}/{method}",
-            data=json.dumps(payload).encode("ascii"),
-            headers={"Content-Type": "application/json"},
+            data=data,
+            headers={"Content-Type": content_type},
         )
         try:
             response = self._http.open(request, timeout=_HTTP_TIMEOUT)
@@ -137,6 +152,38 @@ class TelegramBot:
             except (OSError, http.client.HTTPException, ValueError):
                 body = {}
         return status, body if isinstance(body, dict) else {}
+
+    def _upload_voice(self, audio: Audio) -> None:
+        method, field, filename = _VOICE_FILES[audio.media_type]
+        boundary = uuid4().hex
+        header = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{self._chat_id}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: {audio.media_type}\r\n\r\n"
+        ).encode("ascii")
+        trailer = f"\r\n--{boundary}--\r\n".encode("ascii")
+        if not audio.data or len(header) + len(audio.data) + len(trailer) > _MAX_VOICE_UPLOAD:
+            raise ValueError("invalid voice upload size")
+        # Send once. Text delivery has its own retry and recovery rules.
+        status, body = self._post(
+            method, b"".join((header, audio.data, trailer)), f"multipart/form-data; boundary={boundary}",
+        )
+        if not 200 <= status < 300 or body.get("ok") is not True:
+            raise TelegramError(status)
+
+    def _send_voice_reply(self, record: Record) -> None:
+        try:
+            provider = voice_for("tts")
+            if provider is None:
+                return
+            audio = provider.synthesize("\n".join(item.text for item in record.items))
+        except Exception:
+            _LOG.warning("Telegram voice synthesis failed")
+            return
+        try:
+            self._upload_voice(audio)
+        except Exception:
+            _LOG.warning("Telegram voice upload failed")
 
     def _request(self, method: str, payload: dict):
         backoff = 1
@@ -187,7 +234,9 @@ class TelegramBot:
             self._store.set_offset(offset)
             self._cursor = (offset, self._now())
 
-    def _resume_deliveries(self) -> None:
+    def _resume_deliveries(self) -> set[int]:
+        """Drain pending text and return the record IDs completed by this call."""
+        delivered = set()
         for record_id, chunks, start in self._store.pending_deliveries():
             record = self._store.get(record_id)
             offset = int(record.update_key.split(":", 1)[0]) + 1
@@ -213,8 +262,11 @@ class TelegramBot:
                     break
                 advance = self._delivery_offset(offset, created) if last else None
                 self._store.mark_sent(record_id, index + 1, offset=advance)
+                if last:
+                    delivered.add(record_id)
             if advance is not None:
                 self._cursor = (advance, self._now())
+        return delivered
 
     def _delivery_offset(self, offset: int, created: datetime) -> int | None:
         # An expired update can still have a reply to send after Telegram resets its IDs.
@@ -341,8 +393,10 @@ class TelegramBot:
             chunks = [_SAFE_ERROR]
         else:
             chunks = _reply_chunks(reply.text)
-        self._store.save(record, chunks=chunks)
-        self._resume_deliveries()
+        record_id = self._store.save(record, chunks=chunks)
+        delivered = self._resume_deliveries()
+        if record_id in delivered and record.kind == "ask" and record.status == "ok":
+            self._send_voice_reply(record)
 
     def poll_once(self) -> None:
         self._resume_deliveries()

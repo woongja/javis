@@ -59,9 +59,15 @@ def api():
         def log_message(self, *_args):
             pass
 
+        def do_GET(self):
+            fake.requests.append(("GET", self.path))
+            self.send_error(405)
+
         def do_POST(self):
             method = self.path.removeprefix(f"/bot{TOKEN}/")
-            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            content_type = self.headers["Content-Type"]
+            data = self.rfile.read(int(self.headers["Content-Length"]))
+            payload = json.loads(data) if content_type == "application/json" else (content_type, data)
             fake.requests.append((method, payload))
             if not fake.expected or fake.expected[0][0] != method:
                 self.send_response(409)
@@ -90,7 +96,8 @@ def api():
 
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, monkeypatch):
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
     return Store.open(tmp_path)
 
 
