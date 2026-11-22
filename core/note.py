@@ -1,7 +1,10 @@
-"""Publish the approved note bytes to a server-generated inbox path."""
+"""Execute approved brain writes."""
 
+import json
 from datetime import UTC, datetime
 
+from brain import _display
+from brain.importer import copy_manifest
 from brain.publish import pin_configured_root, publish
 from worklog import Approval
 
@@ -32,4 +35,18 @@ def create_note(claim: Approval) -> ExecutionResult:
     return ExecutionResult(False, f"메모 생성 실패 ({result.status}) · {reason}")
 
 
-NOTE_EXECUTORS = {"note.create": create_note}
+def import_brain(claim: Approval) -> ExecutionResult:
+    assert claim.status == "executing" and claim.payload is not None
+    try:
+        manifest = json.loads(claim.payload)
+        counts, reason = copy_manifest(manifest)
+    except (KeyError, TypeError, ValueError):
+        return ExecutionResult(False, "가져오기 명세를 확인할 수 없습니다.")
+    summary = " · ".join(f"{status} {counts[status]}" for status in ("published", "conflict", "changed", "failed"))
+    message = f"{_display(manifest['dest'])} · {summary}"
+    if counts["published"]:
+        return ExecutionResult(True, message)
+    return ExecutionResult(False, f"{message} · {reason or '게시된 파일이 없습니다.'}")
+
+
+NOTE_EXECUTORS = {"note.create": create_note, "brain.import": import_brain}

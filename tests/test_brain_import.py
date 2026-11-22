@@ -9,6 +9,11 @@ import pytest
 
 from brain import importer
 from brain.policy import Rejected
+from core import cli
+from core.engine import ClaudeEngine
+from tests.test_core_engine import fake_claude, success
+from tests.test_telegram import api, bot, owner_update
+from worklog import Store
 
 
 @pytest.fixture
@@ -222,3 +227,155 @@ def test_limit_overrun_rejects_whole_manifest(roots, monkeypatch, limit, maximum
     monkeypatch.setattr(importer, limit, maximum)
     with pytest.raises(Rejected, match="범위를 줄이세요"):
         importer.build_manifest(src, "imports")
+
+
+def _propose(src, capsys):
+    store = Store.open(src.with_name("data"))
+    assert cli.main(["brain", "import", str(src), "--dest", "imports/batch"]) == 0
+    [draft] = store.list_approvals("pending")
+    assert draft.id in capsys.readouterr().out
+    return store, draft
+
+
+def _assert_finished(store, draft, status):
+    row = store.get_approval(draft.id)
+    assert (row.status, row.payload, row.payload_hash) == (status, None, None)
+
+
+def test_import_reject_approve_and_repeat(roots, capsys):
+    src, vault = roots
+    _write(src, "nested/a.md", b"original\r\n\xff")
+    _write(src, "empty.md", b"")
+    original = _snapshot(src)
+    store, draft = _propose(src, capsys)
+    assert (draft.kind, draft.owner, draft.allowed_channel) == ("brain.import", cli._os_user(), "cli")
+    assert json.loads(draft.payload) == importer.build_manifest(src, "imports/batch")
+    assert cli.main(["reject", draft.id]) == 0
+    assert list(vault.iterdir()) == []
+    _assert_finished(store, draft, "rejected")
+
+    store, draft = _propose(src, capsys)
+    assert cli.main(["approve", draft.id]) == 0
+    assert "imports/batch · published 2 · conflict 0 · changed 0 · failed 0" in capsys.readouterr().out
+    assert {p.relative_to(vault).as_posix(): p.read_bytes() for p in vault.rglob("*.md")} == {
+        "imports/batch/nested/a.md": b"original\r\n\xff",
+        "imports/batch/empty.md": b"",
+    }
+    saved = _snapshot(vault)
+    assert cli.main(["approve", draft.id]) == 1
+    assert _snapshot(vault) == saved
+    assert _snapshot(src) == original
+    _assert_finished(store, draft, "done")
+
+    assert cli.main(["brain", "import", str(src), "--dest", "imports/batch"]) == 0
+    assert "승인을 제안하지 않았습니다" in capsys.readouterr().out
+    assert store.list_approvals("pending") == []
+
+
+def test_import_uses_only_unchanged_approved_files(roots, capsys):
+    src, vault = roots
+    for name in ("changed.md", "missing.md", "collision.md", "ok.md", "skipped.md"):
+        _write(src, name)
+    _write(vault, "imports/batch/skipped.md", b"existing")
+    store, draft = _propose(src, capsys)
+    _write(src, "changed.md", b"edit")  # Same size, different hash.
+    (src / "missing.md").unlink()
+    _write(src, "new.md")
+    _write(vault, "imports/batch/collision.md", b"new existing file")
+    (vault / "imports/batch/skipped.md").unlink()
+    original = _snapshot(src)
+
+    assert cli.main(["approve", draft.id]) == 0
+    assert "published 1 · conflict 2 · changed 2 · failed 0" in capsys.readouterr().out
+    target = vault / "imports/batch"
+    assert {p.name: p.read_bytes() for p in target.iterdir()} == {
+        "collision.md": b"new existing file", "ok.md": b"test",
+    }
+    assert _snapshot(src) == original
+    _assert_finished(store, draft, "done")
+
+
+def test_import_partial_failure_and_reproposal(roots, capsys, monkeypatch):
+    src, vault = roots
+    for name in ("a.md", "b.md", "c.md"):
+        _write(src, name, name.encode())
+    original = _snapshot(src)
+    store, draft = _propose(src, capsys)
+    publish = importer.publisher.publish
+
+    def fail_middle(root, path, content, **kwargs):
+        if path.endswith("/b.md"):
+            raise RuntimeError("simulated publication failure")
+        return publish(root, path, content, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importer.publisher, "publish", fail_middle)
+        assert cli.main(["approve", draft.id]) == 0
+    assert "published 2 · conflict 0 · changed 0 · failed 1" in capsys.readouterr().out
+    _assert_finished(store, draft, "done")
+    target = vault / "imports/batch"
+    before_retry = _snapshot(target)
+    assert {p.name for p in target.iterdir()} == {"a.md", "c.md"}
+
+    store, retry = _propose(src, capsys)
+    assert cli.main(["approve", retry.id]) == 0
+    assert "published 1 · conflict 2 · changed 0 · failed 0" in capsys.readouterr().out
+    assert all(_snapshot(target)[name] == before_retry[name] for name in ("a.md", "c.md"))
+    assert (target / "b.md").read_bytes() == b"b.md"
+    assert _snapshot(src) == original
+    _assert_finished(store, retry, "done")
+
+
+@pytest.mark.parametrize("invalidated", ["source", "vault", "invalid policy", "restrictive policy"])
+def test_import_fails_when_root_or_policy_changes(roots, capsys, invalidated):
+    src, vault = roots
+    _write(src, "a.md")
+    store, draft = _propose(src, capsys)
+    if invalidated in ("source", "vault"):
+        root = src if invalidated == "source" else vault
+        root.rename(root.with_name("original"))
+        root.mkdir()
+        if root == src:
+            _write(src, "a.md")
+    else:
+        _write(vault, "BRAIN.md", b"../bad" if invalidated == "invalid policy" else b"only-here")
+
+    assert cli.main(["approve", draft.id]) == 1
+    assert "published 0 · conflict 0 · changed 0 · failed 1" in capsys.readouterr().err
+    assert not (vault / "imports").exists()
+    _assert_finished(store, draft, "failed")
+
+
+def test_import_payload_stays_local(roots, api, capsys):
+    src, vault = roots
+    name, body = "ImportFileSentinel.md", "ImportBodySentinel"
+    _write(src, name, body.encode())
+    store, draft = _propose(src, capsys)
+    capture = src.with_name("engine-stdin.txt")
+    envelope = success([{"text": "control answer", "sources": []}])
+    shim = fake_claude(src.parent, f"""
+Path({str(capture)!r}).write_text(question, encoding="utf-8")
+print(json.dumps({envelope!r}))
+""")
+    engine = ClaudeEngine(cli.load_settings(), shim)
+    api.updates(
+        owner_update(40, "승인 대기"),
+        owner_update(41, f"승인 {draft.id}"),
+        owner_update(42, f"거절 {draft.id}"),
+    )
+    for _ in range(3):
+        api.reply()
+    bot(api, store, engine).poll_once()
+    pending, approval, rejection = [request["text"] for request in api.sent()]
+    assert draft.id not in pending and "승인 대기 0건" in pending
+    assert "PC에서만" in approval and "PC에서만" in rejection
+    assert store.get_approval(draft.id) == draft
+    assert not list(vault.iterdir())
+    assert cli.main(["approve", draft.id]) == 0
+    assert not capture.exists()
+    _assert_finished(store, draft, "done")
+    with store._connect() as db:
+        surfaces = repr(api.sent()) + repr(capsys.readouterr())
+        for query in ("SELECT * FROM records", "SELECT * FROM deliveries"):
+            surfaces += repr([tuple(row) for row in db.execute(query)])
+    assert name not in surfaces and body not in surfaces

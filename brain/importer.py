@@ -1,4 +1,4 @@
-"""Build a read-only preview of an explicitly selected Markdown directory."""
+"""Preview and copy approved files from an explicitly selected Markdown directory."""
 
 import hashlib
 import os
@@ -10,6 +10,7 @@ from pathlib import Path
 from core.config import data_dir
 
 from . import Unavailable, _checkout, _is_link, _is_local, _overlaps, _resolve_directory
+from . import publish as publisher
 from .policy import Rejected, _CONTROL, _allowed_directories, _check_policy, relative_parts
 from .publish import (
     VaultRoot,
@@ -75,21 +76,26 @@ def _exclusion(name: str, info: os.stat_result) -> str | None:
     return "unsafe_name"
 
 
-def _source_digest(directory: _Directory, name: str, root: Path, info: os.stat_result) -> str:
+class _SourceChanged(OSError):
+    pass
+
+
+def _source_bytes(directory: _Directory, name: str, root: Path, info: os.stat_result) -> bytes:
+    _verify_file(directory, name, root, info)
     fd = os.open(directory.entry(name), _READ | getattr(os, "O_BINARY", 0), dir_fd=directory.fd)
     with os.fdopen(fd, "rb") as source:
         opened = os.fstat(source.fileno())
         _verify_file(directory, name, root, info)
         if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(info, opened):
-            raise OSError("source file changed")
+            raise _SourceChanged("source file changed")
         content = source.read(info.st_size + 1)
         after = os.fstat(source.fileno())
         if len(content) != info.st_size or (after.st_size, after.st_mtime_ns) != (
             info.st_size, info.st_mtime_ns,
         ):
-            raise OSError("source file changed")
+            raise _SourceChanged("source file changed")
         _verify_file(directory, name, root, info)
-    return hashlib.sha256(content).hexdigest()
+    return content
 
 
 def _existing_directory(stack: ExitStack, root: _Directory, parts: tuple[str, ...]) -> _Directory | None:
@@ -167,7 +173,9 @@ def build_manifest(src: str | Path, dest_rel: str) -> dict:
                                 "src": "/".join(relative),
                                 "dest": target_path,
                                 "size": size,
-                                "sha256": _source_digest(directory, name, source.path, info),
+                                "sha256": hashlib.sha256(
+                                    _source_bytes(directory, name, source.path, info)
+                                ).hexdigest(),
                                 "status": "conflict" if conflict else "copy",
                             })
     except (Rejected, Unavailable):
@@ -183,3 +191,79 @@ def build_manifest(src: str | Path, dest_rel: str) -> dict:
         "totals": {"count": len(files), "bytes": total_bytes},
         "excluded": dict(sorted(excluded.items())),
     }
+
+
+def _approved_content(source: VaultRoot, parts: tuple[str, ...], file: dict) -> bytes:
+    with ExitStack() as stack:
+        root = _checked_root(stack, source)
+        directory = _target_directory(stack, root, parts[:-1], create=False)
+        name = parts[-1]
+        info = os.lstat(directory.entry(name), dir_fd=directory.fd)
+        if not stat.S_ISREG(info.st_mode) or _exclusion(name, info) or info.st_size != file["size"]:
+            raise _SourceChanged("source file changed")
+        content = _source_bytes(directory, name, source.path, info)
+    if hashlib.sha256(content).hexdigest() != file["sha256"]:
+        raise _SourceChanged("source file changed")
+    return content
+
+
+def copy_manifest(manifest: dict) -> tuple[Counter[str], str | None]:
+    """Recheck the approved scope and publish only bytes matching the manifest."""
+    counts: Counter[str] = Counter()
+    copies = []
+    destination = manifest["dest"]
+    dest_parts = relative_parts(destination)
+    for file in manifest["files"]:
+        parts = relative_parts(file["src"])
+        target = "/".join((*dest_parts, *parts))
+        size = file["size"]
+        if (
+            file["dest"] != target or Path(parts[-1]).suffix.casefold() != ".md"
+            or type(size) is not int or not 0 <= size <= MAX_FILE_BYTES
+            or not isinstance(file["sha256"], str)
+            or file["status"] not in ("conflict", "copy")
+        ):
+            raise Rejected("invalid import entry")
+        if file["status"] == "conflict":
+            counts["conflict"] += 1
+        else:
+            copies.append((file, parts))
+
+    source_path = Path(manifest["source_root"]["realpath"])
+    try:
+        vault = pin_configured_root()
+        protected = (vault.path, _checkout(), data_dir())
+        if not _is_local(source_path) or any(
+            _overlaps(source_path, path) for path in protected if path is not None
+        ):
+            raise Rejected(_OVERLAP)
+        source = pin_root(source_path)
+        if _root_id(vault) != manifest["brain_root"] or _root_id(source) != manifest["source_root"]:
+            raise Rejected("approved roots changed")
+    except (OSError, RuntimeError, ValueError):
+        counts["failed"] += len(copies)
+        return counts, "승인한 원본 또는 두뇌 루트를 확인할 수 없습니다."
+
+    try:
+        with ExitStack() as stack:
+            _allowed_directories(_read_policy(_checked_root(stack, vault)))
+    except (OSError, Rejected):
+        counts["failed"] += len(copies)
+        return counts, "두뇌 루트 또는 BRAIN.md 정책을 확인할 수 없습니다."
+
+    for file, parts in copies:
+        try:
+            content = _approved_content(source, parts, file)
+        except (_SourceChanged, FileNotFoundError, Rejected):
+            counts["changed"] += 1
+            continue
+        except OSError:
+            counts["failed"] += 1
+            continue
+        try:
+            status = publisher.publish(vault, file["dest"], content, import_destination=destination).status
+        except Exception:
+            counts["failed"] += 1
+            continue
+        counts["failed" if status == "rejected" else status] += 1
+    return counts, None

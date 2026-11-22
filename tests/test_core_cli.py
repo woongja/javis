@@ -28,22 +28,22 @@ def test_brain_import_preview_stays_local(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
 
     def forbidden(*args, **kwargs):
-        pytest.fail("preview opened the worklog or engine")
+        pytest.fail("import called the engine")
 
-    monkeypatch.setattr(cli.Store, "open", forbidden)
     monkeypatch.setattr(cli, "ClaudeEngine", forbidden)
     assert cli.main(["brain", "import", str(source), "--dest", "imports"]) == 0
+    [proposal] = Store.open(data).list_approvals("pending")
     output = capsys.readouterr()
     assert output.err == ""
     assert "복사 예정 11건 · 충돌 1건" in output.out
     assert "합계 12건 · 140바이트" in output.out
     assert "nested/old.md → imports/nested/old.md (충돌로 건너뜀)" in output.out
     assert "외 2건" in output.out
-    assert "승인 기능은 아직 없음(작업 10)" in output.out
+    assert all(text in output.out for text in (proposal.id, proposal.expires_at, "승인하면 11건 복사"))
     assert str(source) not in output.out
     assert str(vault) not in output.out
     assert "private note" not in output.out
-    assert not data.exists()
+    assert sorted(path.name for path in vault.rglob("*.md")) == ["OLD.md"]
 
 
 def test_brain_import_rejection_and_unconfigured_vault(tmp_path, monkeypatch, capsys):
@@ -206,7 +206,10 @@ def test_pending_lists_only_actionable_approvals_and_expires_old_ones(approvals,
     store, service, actor = approvals
     now = datetime.now(UTC)
     note = service.propose("note.create", "Draft\npreview", actor, "cli", now - timedelta(seconds=1))
-    manifest = {"dest": "archive", "files": ["one.md", "two.md"]}
+    manifest = {"dest": "archive", "files": [
+        {"src": "one.md", "status": "copy", "size": 12},
+        {"src": "two.md", "status": "conflict", "size": 20},
+    ]}
     imported = service.propose("brain.import", manifest, actor, "cli", now)
     expired = service.propose("note.create", "expired", actor, "cli", now - timedelta(days=2))
     phone = service.propose("note.create", "phone draft", "chat", "telegram", now + timedelta(seconds=1))
@@ -218,7 +221,7 @@ def test_pending_lists_only_actionable_approvals_and_expires_old_ones(approvals,
         f"{row.id}\t{row.kind}\t{summary}\t{datetime.fromisoformat(row.expires_at).astimezone():%Y-%m-%d %H:%M}"
         for row, summary in [
             (note, f"{cli.note_path(note)}\tDraft preview"),
-            (imported, "archive (2개 파일)"),
+            (imported, "archive (복사 예정 1건 · 12바이트)"),
             (phone, f"{cli.note_path(phone)}\tphone draft"),
         ]
     ]
@@ -247,8 +250,9 @@ def test_approve_once_and_reject_without_execution(approvals, monkeypatch, capsy
     assert "이미 결정된" in capsys.readouterr().err
 
 
-def test_approve_without_executor_preserves_proposal(approvals, capsys):
+def test_approve_without_executor_preserves_proposal(approvals, capsys, monkeypatch):
     store, service, actor = approvals
+    monkeypatch.setattr(cli, "NOTE_EXECUTORS", {})
     proposed = service.propose("brain.import", {"files": []}, actor, "cli")
     assert cli.main(["approve", proposed.id]) != 0
     assert "실행기 미등록" in capsys.readouterr().err

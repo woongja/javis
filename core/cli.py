@@ -10,7 +10,7 @@ from pathlib import Path
 
 from brain import Unavailable, _display
 from brain.importer import build_manifest
-from brain.policy import Rejected
+from brain.policy import Rejected, relative_parts
 from channels.telegram.bot import TelegramBot, TelegramError
 from harness import HarnessError
 from harness.paths import env_value, repo_root
@@ -86,21 +86,21 @@ def _approval_summary(approval: Approval) -> str:
         return f"{note_path(approval)}\t{_approval_preview(approval.payload or '')}"
     try:
         manifest = json.loads(approval.payload or "")
-    except ValueError:
+        destination = "/".join(relative_parts(manifest["dest"]))
+        count, size = _planned_copy(manifest)
+    except (KeyError, TypeError, ValueError):
         return "가져오기"
-    if not isinstance(manifest, dict):
-        return "가져오기"
-    destination = manifest.get("dest")
-    summary = _approval_preview(destination) if isinstance(destination, str) else "가져오기"
-    files = manifest.get("files")
-    return f"{summary} ({len(files)}개 파일)" if isinstance(files, list) else summary
+    return f"{_display(destination)} (복사 예정 {count}건 · {size}바이트)"
 
 
 def _list_pending(store: Store, actor: str) -> int:
     pending = [
         row for row in store.list_approvals("pending") if row.can_decide(actor, "cli")
     ]
-    interrupted = [row for row in store.list_approvals("executing") if is_interrupted(row)]
+    interrupted = [
+        row for row in store.list_approvals("executing")
+        if row.can_decide(actor, "cli") and is_interrupted(row)
+    ]
     for row in pending + interrupted:
         expires = datetime.fromisoformat(row.expires_at).astimezone()
         line = f"{row.id}\t{row.kind}\t{_approval_summary(row)}\t{expires:%Y-%m-%d %H:%M}"
@@ -146,17 +146,15 @@ def _resolve(store: Store, id: str, *, ok: bool) -> int:
     return _approval_message("완료로 마감했습니다." if ok else "실패로 마감했습니다.", ok=True)
 
 
-def _brain_import_preview(src: str, dest: str) -> int:
-    try:
-        manifest = build_manifest(src, dest)
-    except (Rejected, Unavailable) as error:
-        print(f"javis: {error}", file=sys.stderr)
-        return 1
+def _planned_copy(manifest: dict) -> tuple[int, int]:
+    copies = [file["size"] for file in manifest["files"] if file["status"] == "copy"]
+    return len(copies), sum(copies)
 
+
+def _brain_import_preview(manifest: dict, count: int) -> None:
     files = manifest["files"]
     totals = manifest["totals"]
-    conflicts = sum(file["status"] == "conflict" for file in files)
-    print(f"복사 예정 {totals['count'] - conflicts}건 · 충돌 {conflicts}건")
+    print(f"복사 예정 {count}건 · 충돌 {totals['count'] - count}건")
     print(f"합계 {totals['count']}건 · {totals['bytes']}바이트")
     limit = 10
     for file in files[:limit]:
@@ -166,8 +164,6 @@ def _brain_import_preview(src: str, dest: str) -> int:
         print(f"  {source} → {target} ({status})")
     if len(files) > limit:
         print(f"  외 {len(files) - limit}건")
-    print("승인 기능은 아직 없음(작업 10)")
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -187,9 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     resolve = commands.add_parser("resolve", help="Record the verified outcome of an interrupted run")
     resolve.add_argument("id", metavar="ID")
     resolve.add_argument("outcome", choices=("done", "failed"))
-    brain = commands.add_parser("brain", help="Preview local vault operations")
+    brain = commands.add_parser("brain", help="Manage local vault operations")
     brain_actions = brain.add_subparsers(dest="brain_action", required=True)
-    preview = brain_actions.add_parser("import", help="Preview the import of a Markdown directory")
+    preview = brain_actions.add_parser("import", help="Preview and propose importing a Markdown directory")
     preview.add_argument("src")
     preview.add_argument("--dest", required=True, metavar="RELATIVE_PATH")
     args = parser.parse_args(argv)
@@ -197,7 +193,14 @@ def main(argv: list[str] | None = None) -> int:
         ask.error("text must not be empty")
 
     if args.command == "brain" and args.brain_action == "import":
-        return _brain_import_preview(args.src, args.dest)
+        try:
+            manifest = build_manifest(args.src, args.dest)
+        except (Rejected, Unavailable) as error:
+            return _approval_message(f"javis: {error}")
+        count, _ = _planned_copy(manifest)
+        _brain_import_preview(manifest, count)
+        if not count:
+            return _approval_message("복사할 파일이 없어 승인을 제안하지 않았습니다.", ok=True)
 
     if args.command == "serve":
         try:
@@ -225,6 +228,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         store = Store.open(directory)
+        if args.command == "brain":
+            proposal = ApprovalService(store).propose("brain.import", manifest, _os_user(), "cli")
+            return _approval_message(
+                f"승인 ID {proposal.id}\n만료 {proposal.expires_at}\n승인하면 {count}건 복사", ok=True,
+            )
         if args.command == "serve":
             try:
                 token, chat_id = telegram
