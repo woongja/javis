@@ -73,6 +73,19 @@ def _executor_identity() -> tuple[int, str]:
     return pid, process_started_at(pid)
 
 
+def is_interrupted(approval: Approval) -> bool:
+    """Require evidence that the recorded executor has exited or its PID was reused."""
+    pid = approval.executor_pid
+    if approval.status != "executing" or pid is None or pid <= 0 or not approval.executor_started_at:
+        return False
+    try:
+        return process_started_at(pid) != approval.executor_started_at
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+
 def process_started_at(pid: int) -> str:
     """Return an OS start time suitable for comparing two sightings of a PID."""
     if sys.platform == "win32":
@@ -80,9 +93,17 @@ def process_started_at(pid: int) -> str:
     if sys.platform == "darwin":
         return _macos_process_started_at(pid)
     if sys.platform == "linux":
-        stat = Path(f"/proc/{pid}/stat").read_bytes()
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+        except FileNotFoundError:
+            # A hidden or unavailable /proc entry is not proof of exit.
+            os.kill(pid, 0)
+            raise
         # Field 22 is ticks since boot. The process name in field 2 can contain spaces and parens.
-        ticks = int(stat.rsplit(b")", 1)[1].split()[19])
+        fields = stat.rsplit(b")", 1)[1].split()
+        if fields[0] in (b"Z", b"X"):
+            raise ProcessLookupError
+        ticks = int(fields[19])
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         return f"{boot_id}:{ticks}"
     raise OSError("process start time is unavailable on this platform")
@@ -101,13 +122,18 @@ def _windows_process_started_at(pid: int) -> str:
 
     process = api.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not process:
-        raise ctypes.WinError(ctypes.get_last_error())
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such PID
+            raise ProcessLookupError
+        raise ctypes.WinError(error)
     try:
         created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
         if not api.GetProcessTimes(
             process, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+        if exited.dwHighDateTime or exited.dwLowDateTime:
+            raise ProcessLookupError
         return str((created.dwHighDateTime << 32) | created.dwLowDateTime)
     finally:
         api.CloseHandle(process)

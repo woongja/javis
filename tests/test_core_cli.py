@@ -1,8 +1,13 @@
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
-from core import cli
+import pytest
+
+from core import approval, cli
+from core.approval import ApprovalService
 from worklog.store import Store
 
 from tests.test_core_engine import fake_claude, success
@@ -95,3 +100,145 @@ def test_default_data_dir_inside_checkout_is_refused(monkeypatch, capsys):
     monkeypatch.setattr(Path, "home", lambda: checkout)
     assert cli.main(["log"]) != 0
     assert "~/.javis" in capsys.readouterr().err
+
+
+@pytest.fixture
+def approvals(tmp_path, monkeypatch):
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    store = Store.open(tmp_path)
+    return store, ApprovalService(store), cli._os_user()
+
+
+def test_pending_lists_only_actionable_approvals_and_expires_old_ones(approvals, capsys):
+    store, service, actor = approvals
+    now = datetime.now(UTC)
+    note = service.propose("note.create", "Draft\npreview", actor, "cli", now - timedelta(seconds=1))
+    manifest = {"dest": "archive", "files": ["one.md", "two.md"]}
+    imported = service.propose("brain.import", manifest, actor, "cli", now)
+    expired = service.propose("note.create", "expired", actor, "cli", now - timedelta(days=2))
+    service.propose("note.create", "other channel", actor, "telegram")
+    service.propose("note.create", "other owner", "different-user", "cli")
+
+    assert cli.main(["pending"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"{row.id}\t{row.kind}\t{summary}\t{datetime.fromisoformat(row.expires_at).astimezone():%Y-%m-%d %H:%M}"
+        for row, summary in [(note, "Draft preview"), (imported, "archive (2개 파일)")]
+    ]
+    assert store.get_approval(expired.id).status == "expired"
+
+
+@pytest.mark.parametrize(("ok", "status", "exit_code"), [(True, "done", 0), (False, "failed", 1)])
+def test_approve_once_and_reject_without_execution(approvals, monkeypatch, capsys, ok, status, exit_code):
+    store, service, actor = approvals
+    executed = []
+
+    def publish(claim):
+        executed.append(claim.payload)
+        return ok
+
+    monkeypatch.setattr(cli, "ApprovalService", lambda store: ApprovalService(store, {"note.create": publish}))
+    approved = service.propose("note.create", "saved draft", actor, "cli")
+    rejected = service.propose("note.create", "reject this", actor, "cli")
+
+    assert cli.main(["approve", approved.id]) == exit_code
+    assert store.get_approval(approved.id).status == status
+    assert cli.main(["approve", approved.id]) != 0
+    assert cli.main(["reject", rejected.id]) == 0
+    assert executed == ["saved draft"]
+    assert store.get_approval(rejected.id).status == "rejected"
+    assert "이미 결정된" in capsys.readouterr().err
+
+
+def test_approve_without_executor_preserves_proposal(approvals, capsys):
+    store, service, actor = approvals
+    proposed = service.propose("brain.import", {"files": []}, actor, "cli")
+    assert cli.main(["approve", proposed.id]) != 0
+    assert "실행기 미등록" in capsys.readouterr().err
+    assert store.get_approval(proposed.id) == proposed
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_interrupted_approval_is_resolved_without_reexecution(approvals, monkeypatch, capsys, published):
+    store, service, actor = approvals
+    proposed = service.propose("note.create", "draft", actor, "cli")
+    effects = []
+
+    def interrupted(*args):
+        raise RuntimeError("simulated interruption")
+
+    def publish(claim):
+        effects.append(claim.payload)
+        return True
+
+    with monkeypatch.context() as patch:
+        original_decide = ApprovalService.decide
+
+        def decide_then_interrupt(self, *args):
+            original_decide(self, *args)
+            interrupted()
+
+        if published:
+            patch.setattr(ApprovalService, "finish", interrupted)
+        else:
+            patch.setattr(ApprovalService, "decide", decide_then_interrupt)
+        patch.setattr(cli, "ApprovalService", lambda store: ApprovalService(store, {"note.create": publish}))
+        if published:
+            assert cli.main(["approve", proposed.id]) != 0
+        else:
+            with pytest.raises(RuntimeError, match="simulated interruption"):
+                cli.main(["approve", proposed.id])
+
+    claim = store.get_approval(proposed.id)
+    assert claim.status == "executing"
+
+    def process_started_at(pid):
+        if published:
+            return "reused PID"
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(approval, "process_started_at", process_started_at)
+    monkeypatch.setattr(cli, "ApprovalService", lambda store: ApprovalService(store, {"note.create": publish}))
+    assert cli.main(["approve", proposed.id]) != 0
+    assert cli.main(["pending"]) == 0
+    out = capsys.readouterr().out
+    assert f"{proposed.id}\t" in out and "결과 미상 — 확인 필요" in out
+    outcome = "done" if published else "failed"
+    assert cli.main(["resolve", proposed.id, outcome]) == 0
+    assert cli.main(["resolve", proposed.id, "failed"]) != 0
+    assert effects == (["draft"] if published else [])
+    resolved = store.get_approval(proposed.id)
+    assert resolved.status == outcome
+    assert resolved.payload is resolved.payload_hash is None
+
+
+def test_live_other_executor_cannot_be_resolved(approvals, monkeypatch, capsys):
+    store, service, actor = approvals
+    proposed = service.propose("note.create", "draft", actor, "cli")
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]) as executor:
+        try:
+            identity = (executor.pid, approval.process_started_at(executor.pid))
+            monkeypatch.setattr(approval, "_executor_identity", lambda: identity)
+            claim = service.decide(proposed.id, actor, "cli", True).approval
+            assert cli.main(["pending"]) == 0
+            assert not capsys.readouterr().out
+            assert cli.main(["resolve", proposed.id, "failed"]) != 0
+            assert store.get_approval(proposed.id) == claim
+        finally:
+            executor.terminate()
+    assert cli.main(["pending"]) == 0
+    assert "결과 미상 — 확인 필요" in capsys.readouterr().out
+
+
+def test_unverifiable_executor_cannot_be_resolved(approvals, monkeypatch, capsys):
+    store, service, actor = approvals
+    proposed = service.propose("note.create", "draft", actor, "cli")
+    claim = service.decide(proposed.id, actor, "cli", True).approval
+
+    def inaccessible(pid):
+        raise PermissionError(pid)
+
+    monkeypatch.setattr(approval, "process_started_at", inaccessible)
+    assert cli.main(["pending"]) == 0
+    assert not capsys.readouterr().out
+    assert cli.main(["resolve", proposed.id, "failed"]) != 0
+    assert store.get_approval(proposed.id) == claim
