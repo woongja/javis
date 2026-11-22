@@ -13,6 +13,14 @@ from worklog.store import Store
 from tests.test_core_engine import fake_claude, success
 
 
+@pytest.mark.parametrize("command", [[], ["ask"]])
+def test_help_discloses_external_routing(command, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main([*command, "--help"])
+    assert exit_info.value.code == 0
+    assert "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다." in capsys.readouterr().out
+
+
 def test_ask_stores_and_log_lists_answer(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path / "data"))
     texts = ["1. A", "**1. A** – b", "1) A", "답변", "2026년 뉴스", "2026. 11. 21. Anthropic 발표"]

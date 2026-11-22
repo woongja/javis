@@ -161,9 +161,12 @@ def _resolve(store: Store, id: str, *, ok: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="javis", description="Ask javis, view the local worklog, and manage approvals.")
+    external = "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다."
+    parser = argparse.ArgumentParser(
+        prog="javis", description="Ask javis, view the local worklog, and manage approvals.", epilog=external,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    ask = commands.add_parser("ask", help="Ask a question or recall saved sources")
+    ask = commands.add_parser("ask", help="Ask a question or recall saved sources", epilog=external)
     ask.add_argument("text")
     log = commands.add_parser("log", help="Show recent worklog entries")
     log.add_argument("-n", metavar="N", type=_count, default=20)

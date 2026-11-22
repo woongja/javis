@@ -25,7 +25,7 @@ class Record:
     id: int | None
     created_at: str
     channel: str
-    kind: Literal["ask", "recall", "approval"]
+    kind: Literal["ask", "recall", "approval", "local", "notice"]
     request: str
     items: tuple[Item, ...]
     status: Literal["ok", "error", "timeout", "quota", "denied"]
@@ -144,14 +144,14 @@ _MIGRATE_V1_TO_V2 = (
     """,
 )
 
-_MIGRATE_V2_TO_V3 = (
-    """
-    CREATE TABLE records_v3 (
+
+_CREATE_RECORDS_NEW = """
+    CREATE TABLE records_new (
         id INTEGER PRIMARY KEY,
         created_at TEXT NOT NULL,
         created_utc TEXT NOT NULL,
         channel TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('ask', 'recall', 'approval')),
+        kind TEXT NOT NULL CHECK (kind IN ({record_kinds})),
         request TEXT NOT NULL,
         items TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('ok', 'error', 'timeout', 'quota', 'denied')),
@@ -162,28 +162,35 @@ _MIGRATE_V2_TO_V3 = (
         ref_id INTEGER,
         update_key TEXT UNIQUE
     )
-    """,
-    "INSERT INTO records_v3 SELECT * FROM records",
+"""
+_REBUILD_RECORDS = (
+    "INSERT INTO records_new SELECT * FROM records",
     # Rebuild the child table so foreign key enforcement can stay enabled.
     """
-    CREATE TABLE deliveries_v3 (
-        record_id INTEGER PRIMARY KEY REFERENCES records_v3 (id),
+    CREATE TABLE deliveries_new (
+        record_id INTEGER PRIMARY KEY REFERENCES records_new (id),
         chunks TEXT NOT NULL,
         chunk_count INTEGER NOT NULL,
         next_index INTEGER NOT NULL DEFAULT 0 CHECK (next_index BETWEEN 0 AND chunk_count),
         failure_reason TEXT
     )
     """,
-    "INSERT INTO deliveries_v3 SELECT * FROM deliveries",
+    "INSERT INTO deliveries_new SELECT * FROM deliveries",
     "DROP TABLE deliveries",
     "DROP TABLE records",
-    "ALTER TABLE records_v3 RENAME TO records",
-    "ALTER TABLE deliveries_v3 RENAME TO deliveries",
+    "ALTER TABLE records_new RENAME TO records",
+    "ALTER TABLE deliveries_new RENAME TO deliveries",
     "CREATE INDEX records_created ON records (created_utc, id)",
     """
     CREATE INDEX records_ok_asks ON records (created_utc, id)
     WHERE kind = 'ask' AND status = 'ok'
     """,
+)
+
+
+_MIGRATE_V2_TO_V3 = (
+    _CREATE_RECORDS_NEW.format(record_kinds="'ask', 'recall', 'approval'"),
+    *_REBUILD_RECORDS,
     """
     CREATE TABLE telegram_note_proposals (
         approval_id TEXT PRIMARY KEY NOT NULL REFERENCES approvals (id),
@@ -191,7 +198,11 @@ _MIGRATE_V2_TO_V3 = (
     )
     """,
 )
-_MIGRATIONS = (_SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3)
+_MIGRATE_V3_TO_V4 = (
+    _CREATE_RECORDS_NEW.format(record_kinds="'ask', 'recall', 'approval', 'local', 'notice'"),
+    *_REBUILD_RECORDS,
+)
+_MIGRATIONS = (_SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3, _MIGRATE_V3_TO_V4)
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
 

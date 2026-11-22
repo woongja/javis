@@ -310,6 +310,10 @@ class TelegramBot:
         staged = _DeferredSave(self._store)
         reply = handle(Request("telegram", text, key), staged, self._engine, self._now())
         record = staged.record
+        if reply.kind == "local_only":
+            self._store.save(record)
+            self._advance(offset)
+            return
         fields = [reply.text, record.reason or "", record.model or ""]
         for item in record.items:
             fields.extend((item.text, *item.sources))

@@ -1,5 +1,6 @@
 import json
 from collections import deque
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -8,10 +9,11 @@ import pytest
 
 from channels.telegram.bot import TelegramBot, TelegramError
 from channels.telegram import bot as telegram
-from core import cli
+from core import cli, gateway
 from core.approval import ApprovalService
 from core.config import EngineSettings
 from core.engine import ClaudeEngine, EngineResult
+from teams import LocalOnly, registry
 from worklog.store import Item, Store
 
 TOKEN = "synthetic-bot-value"
@@ -104,6 +106,41 @@ def bot(api, store, engine, **options):
 
     return TelegramBot(TOKEN, CHAT, store, engine, api_base=api.url,
                        **({"sleep": unexpected_sleep} | options))
+
+
+@pytest.mark.parametrize("text", ["/brain", "/brain private-query"])
+def test_brain_redirects_telegram_to_pc(api, store, text):
+    engine = FakeEngine()
+    api.updates(update(text=text))
+    api.reply()
+    bot(api, store, engine).poll_once()
+
+    [sent] = api.sent()
+    assert 'PC에서 `javis ask "/brain …"`' in sent["text"]
+    assert "private-query" not in sent["text"]
+    record = store.by_update_key("40:101")
+    assert record.request == "" and not record.items
+    assert not engine.calls
+
+
+def test_local_only_result_creates_no_telegram_delivery(api, store, monkeypatch):
+    def teams(engine):
+        entries = registry(engine)
+        entries["/note"] = replace(
+            entries["/note"], unavailable_reason="", handler=lambda *_: LocalOnly("private-result"),
+        )
+        return entries
+
+    monkeypatch.setattr(gateway, "registry", teams)
+    engine = FakeEngine()
+    message = update(text="/note private-query")
+    api.updates(message, message)
+    bot(api, store, engine).poll_once()
+
+    [record] = store.recent(10)
+    assert (record.request, record.items, record.status) == ("", (), "ok")
+    assert store.get_offset()[0] == 41
+    assert not store.pending_deliveries() and not api.sent() and not engine.calls
 
 
 def test_denied_unsupported_and_empty_poll(api, store):

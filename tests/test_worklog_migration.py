@@ -3,13 +3,14 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
+from datetime import datetime
 from threading import Barrier
 
 import pytest
 
 from tests.test_worklog_store import SAMPLE
 from worklog import Store
-from worklog.store import _SCHEMA_VERSION
+from worklog.store import _MIGRATIONS, _SCHEMA_VERSION
 
 
 # Snapshot of the version 1 DDL, independent of Store.open and its migrations.
@@ -94,6 +95,51 @@ def test_migrates_v1_and_preserves_worklog(v1_db):
     assert reopened.get(V1_RECORD.id) == V1_RECORD
     assert reopened.pending_deliveries() == []
     assert reopened.get_offset()[0] == 43
+
+
+def test_migrates_v3_and_preserves_delivery_and_approval(v1_db):
+    with closing(sqlite3.connect(v1_db)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        for migration in _MIGRATIONS[1:3]:
+            for statement in migration:
+                db.execute(statement)
+        db.execute("UPDATE schema_version SET version = 3")
+
+    old = Store(v1_db)
+    now = datetime.fromisoformat(V1_RECORD.created_at)
+    approval_key = "43:1795219200"
+    approval = old.create_telegram_note_proposal(
+        owner="test-chat", message_id=7, update_key=approval_key, now=now,
+        payload="Example note", delivery=lambda *_: ["Approval reply"],
+    )
+    approval_record = old.by_update_key(approval_key)
+    old.mark_failed(approval_record.id, "test failure")
+
+    store = Store.open(v1_db.parent)
+    assert store.get(V1_RECORD.id) == store.by_update_key(V1_RECORD.update_key) == V1_RECORD
+    assert store.pending_deliveries() == [(V1_RECORD.id, V1_CHUNKS, 1)]
+    assert store.get_offset() == V1_CURSOR
+    assert store.by_update_key(approval_key) == approval_record
+    assert store.get_approval(approval.id) == approval
+    assert store.telegram_pending_notes(approval.owner, now) == [(7, approval.expires_at, approval.id)]
+
+    for kind in ("local", "notice"):
+        record = replace(SAMPLE, kind=kind, request="", items=())
+        record_id = store.save(record)
+        assert store.get(record_id) == replace(record, id=record_id)
+    assert store.last_ok_ask() == V1_RECORD
+
+    with store._connect() as db:
+        assert db.execute("SELECT version FROM schema_version").fetchone()[0] == _SCHEMA_VERSION
+        failed_delivery = db.execute(
+            "SELECT chunks, failure_reason FROM deliveries WHERE record_id = ?", (approval_record.id,)
+        ).fetchone()
+        assert (json.loads(failed_delivery["chunks"]), failed_delivery["failure_reason"]) == (
+            ["Approval reply"], "test failure",
+        )
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            db.execute("UPDATE deliveries SET record_id = -1 WHERE record_id = ?", (V1_RECORD.id,))
 
 
 def test_two_stores_can_migrate_the_same_v1_database(v1_db):

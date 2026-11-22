@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from worklog import Item, Record, Store
-from worklog.store import _MIGRATIONS
+from worklog.store import _MIGRATIONS, _SCHEMA_VERSION
 
 
 SAMPLE = Record(
@@ -317,7 +317,7 @@ def test_upgrade_v2_preserves_approval_history_and_partial_delivery(tmp_path, ap
     assert upgraded.telegram_pending_notes(approval_fields["owner"], datetime.fromisoformat(approval_fields["created_at"])) == []
     upgraded.save_telegram_approval_reply("43:101", datetime.fromisoformat(record.created_at), "pending", ["reply"])
     with upgraded._connect() as db:
-        assert db.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert db.execute("SELECT version FROM schema_version").fetchone()[0] == _SCHEMA_VERSION
         row = db.execute("SELECT kind, reason FROM records WHERE update_key = '43:101'").fetchone()
         assert tuple(row) == ("approval", "pending")
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
