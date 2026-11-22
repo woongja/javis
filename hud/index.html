@@ -1,10 +1,61 @@
 <!doctype html>
 <html lang="ko">
-<meta charset="utf-8">
-<title>javis HUD</title>
-<h1>javis HUD</h1>
-<form method="post" action="/session">
-  <label>터미널에 표시된 일회용 코드 <input type="password" name="nonce" autocomplete="off" required></label>
-  <button>세션 시작</button>
-</form>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>javis HUD</title>
+  <link rel="stylesheet" href="/static/hud.css">
+  <script src="/static/hud.js" defer></script>
+  <script src="/static/bg.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <span class="brand"><span class="brand-mark" aria-hidden="true"></span>javis <span>HUD</span></span>
+      <span id="connection" class="connection" role="status">연결 확인 중</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero" aria-labelledby="hero-title">
+      <canvas id="backdrop" aria-hidden="true"></canvas>
+      <div class="hero-content">
+        <h1 id="hero-title">로컬 관제 화면</h1>
+        <p>최근 일지, 팀 상태, 대기 중인 승인을 확인하세요.</p>
+        <div id="signin">
+          <form method="post" action="/session">
+            <label for="nonce">터미널에 표시된 일회용 코드</label>
+            <div class="form-row">
+              <input id="nonce" name="nonce" type="password" required maxlength="128"
+                     autocomplete="off" autocapitalize="none" spellcheck="false">
+              <button type="submit" class="primary" disabled>세션 시작</button>
+            </div>
+          </form>
+          <p id="signin-message" role="status"></p>
+        </div>
+        <p id="decision-access" hidden>승인과 거절을 사용하려면 javis hud를 다시 시작하고 새 코드로 접속하세요.</p>
+      </div>
+    </section>
+
+    <p id="state-message" class="state-message" role="status"></p>
+    <div id="dashboard" class="dashboard" hidden>
+      <section class="panel approvals" aria-labelledby="approvals-title">
+        <div class="panel-header">
+          <h2 id="approvals-title" tabindex="-1">대기 승인</h2>
+          <span id="approval-count" class="count"></span>
+        </div>
+        <p id="decision-message" class="decision-message" role="status" tabindex="-1"></p>
+        <ul id="approvals" class="entries"></ul>
+      </section>
+      <section class="panel teams" aria-labelledby="teams-title">
+        <div class="panel-header"><h2 id="teams-title">팀 상태</h2></div>
+        <ul id="teams" class="entries"></ul>
+      </section>
+      <section class="panel records" aria-labelledby="records-title">
+        <div class="panel-header"><h2 id="records-title">최근 일지</h2></div>
+        <ul id="records" class="entries"></ul>
+      </section>
+    </div>
+  </main>
+</body>
 </html>

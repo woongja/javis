@@ -25,6 +25,11 @@ _COOKIE = "javis_hud_session"
 _SESSION_SECONDS = 12 * 60 * 60
 _MAX_ATTEMPTS = 5
 _DECISION_ROUTE = re.compile(r"/api/approvals/([0-9a-f]{32})/(approve|reject)")
+_STATIC_TYPES = {
+    "/static/hud.css": "text/css; charset=utf-8",
+    "/static/hud.js": "text/javascript; charset=utf-8",
+    "/static/bg.js": "text/javascript; charset=utf-8",
+}
 _CSP = "default-src 'self'; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
 _DECISION_CODES = {
     "done": 200, "rejected": 200, "not_found": 404, "forbidden": 403,
@@ -79,7 +84,12 @@ class HUDServer(ThreadingHTTPServer):
         self.actor = actor
         self.service = service
         self.teams = registry(ClaudeEngine(EngineSettings()))
-        self.html = files("hud").joinpath("index.html").read_bytes()
+        package = files("hud")
+        self.html = package.joinpath("index.html").read_bytes()
+        self.assets = {
+            path: (package.joinpath("static", path.rsplit("/", 1)[1]).read_bytes(), content_type)
+            for path, content_type in _STATIC_TYPES.items()
+        }
         self.nonce: str | None = secrets.token_urlsafe(32)
         self._session: _Session | None = None
         self._lock = Lock()
@@ -195,7 +205,9 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         method = {"/": "GET", "/api/state": "GET", "/session": "POST"}.get(self.path)
         self.decision_route = _DECISION_ROUTE.fullmatch(self.path)
-        if self.decision_route is not None:
+        if self.path in self.server.assets:
+            method = "GET"
+        elif self.decision_route is not None:
             method = "POST"
         if method is None:
             self._json(404, {"status": "not_found"})
@@ -246,6 +258,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/":
             self._respond(200, self.server.html, "text/html; charset=utf-8")
+        elif self.path in self.server.assets:
+            self._respond(200, *self.server.assets[self.path])
         elif self._session() is None:
             self._json(401, {"status": "session_required"})
         else:

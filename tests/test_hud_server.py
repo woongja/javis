@@ -118,6 +118,45 @@ def test_nonce_origin_and_attempt_limit(hud):
     assert code == 403 and "Set-Cookie" not in headers
 
 
+def test_static_asset_allowlist(hud):
+    server, _, _, _ = hud
+    for name, mime in (
+        ("hud.css", "text/css"),
+        ("hud.js", "text/javascript"),
+        ("bg.js", "text/javascript"),
+    ):
+        path = f"/static/{name}"
+        code, headers, body = request(server, "GET", path)
+        assert code == 200 and body
+        assert headers["Content-Type"] == f"{mime}; charset=utf-8"
+        assert request(server, "POST", path)[0] == 405
+    for path in ("/static/", "/static/../server.py", "/static/%2e%2e/server.py", "/static/hud.js?v=1"):
+        assert request(server, "GET", path)[0] == 404
+
+
+def test_state_preserves_markup_shaped_display_values(hud, monkeypatch):
+    server, store, actor, _ = hud
+    now = datetime.now(UTC)
+    markup = ("<script>alert(1)</script>", "<img onerror>")
+    summaries = {}
+    for value in markup:
+        store.save(Record(
+            None, now.isoformat(), "cli", "ask", value, (),
+            "ok", None, None, None, None, None, None,
+        ))
+        approval = ApprovalService(store).propose("note.create", value, actor, "cli")
+        summaries[approval.id] = value
+    # Actual approval summaries only expose valid paths and counts. Substitute a
+    # markup-shaped summary at that boundary to exercise JSON serialization.
+    monkeypatch.setattr("hud.server.approval_summary", lambda approval: summaries[approval.id])
+
+    code, headers, body = request(server, "GET", "/api/state", headers=login(server))
+    assert code == 200 and headers["Content-Type"] == "application/json"
+    state = json.loads(body)
+    assert {row["question_preview"] for row in state["records"]} == set(markup)
+    assert {row["id"]: row["summary"] for row in state["pending"]} == summaries
+
+
 def test_nonce_single_use_session_expiry_and_logs(hud, capsys, monkeypatch):
     server, _, _, _ = hud
     nonce = server.nonce

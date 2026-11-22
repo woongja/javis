@@ -1,0 +1,146 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  color: #e9f2f5;
+  background: #0a121b;
+  --muted: #a8bbc8;
+  --accent: #80e9d3;
+  --line: #293d4a;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+h1, h2, h3, p { margin: 0; }
+button, input { font: inherit; }
+button:focus-visible, input:focus-visible {
+  outline: 2px solid #b0ffec;
+  outline-offset: 3px;
+}
+
+.topbar { border-bottom: 1px solid var(--line); }
+.topbar-inner, main {
+  width: min(1184px, calc(100% - 48px));
+  margin-inline: auto;
+}
+.topbar-inner {
+  min-height: 68px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.25rem;
+  font-weight: 750;
+}
+.brand-mark {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 3px #0a121b, inset 0 0 0 5px var(--accent);
+  margin-right: 4px;
+}
+.brand span:last-child, .connection { color: var(--muted); }
+.connection { font-size: .875rem; text-align: right; }
+
+main { padding-block: 28px 48px; }
+.hero {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: radial-gradient(ellipse at 85% 50%, #123b41, #101f2c 60%, #10202a);
+}
+.hero-content {
+  position: relative;
+  min-height: 224px;
+  padding: clamp(24px, 5vw, 56px);
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 12px;
+}
+.hero h1 { font-size: clamp(1.75rem, 5vw, 3.25rem); letter-spacing: -.045em; }
+.hero p { color: #c0d2dc; line-height: 1.55; }
+#backdrop { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+#signin { margin-top: 12px; max-width: 100%; }
+form label { display: block; margin-bottom: 8px; font-size: .875rem; }
+.form-row, .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.form-row input {
+  width: min(100%, 240px);
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid #52717e;
+  border-radius: 8px;
+  background: #0c1923;
+  color: inherit;
+}
+button {
+  min-height: 44px;
+  padding: 8px 16px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.primary { background: var(--accent); color: #0a251f; }
+.secondary { border-color: #716173; background: #302735; color: #ffe1e7; }
+.primary:not(:disabled):hover { background: #abfae9; }
+.secondary:not(:disabled):hover { background: #473346; }
+button:disabled { background: #2b3943; color: #b6c2cb; border-color: #435662; cursor: default; }
+
+.dashboard {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  margin-top: 20px;
+}
+.panel {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #101b26;
+  overflow-wrap: anywhere;
+}
+.records { grid-column: 1 / -1; }
+.panel-header, .entry-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px 14px;
+}
+.panel-header { padding: 18px 20px; }
+.panel h2 { font-size: 1.1rem; }
+.count, .badge {
+  padding: 3px 9px;
+  border-radius: 999px;
+  color: #d1dce5;
+  background: #243341;
+  font-size: .8rem;
+  line-height: 1.4;
+}
+.count, .available { color: var(--accent); background: #153831; }
+.entries { list-style: none; margin: 0; padding: 0; }
+.entries li { display: grid; gap: 8px; padding: 16px 20px; border-top: 1px solid var(--line); }
+.entries h3 { font-size: .95rem; }
+.entries p { line-height: 1.55; }
+.entry-time, .expiry, .empty { color: var(--muted); font-size: .875rem; }
+.actions { margin-top: 4px; }
+.state-message, .decision-message, #signin-message { overflow-wrap: anywhere; line-height: 1.5; }
+.state-message, #signin-message { color: #ffdca4; }
+.state-message:not(:empty), #signin-message:not(:empty) { margin-top: 12px; }
+.decision-message { color: var(--accent); margin-inline: 20px; }
+.decision-message:not(:empty) { margin-bottom: 14px; }
+
+@media (max-width: 680px) {
+  .topbar-inner, main { width: calc(100% - 32px); }
+  .dashboard { grid-template-columns: minmax(0, 1fr); }
+  #backdrop { opacity: .32; }
+}
