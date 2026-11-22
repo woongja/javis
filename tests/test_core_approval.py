@@ -39,6 +39,68 @@ def test_propose_snapshots_import_payload(service):
     assert json.loads(decision.approval.payload) == {"files": ["draft.md"]}
 
 
+def test_telegram_note_proposal_rolls_back_and_replays_saved_delivery(tmp_path, service):
+    store = Store.open(tmp_path)
+    text = " private draft\nwith original whitespace "
+    key = "42:101"
+    with store._connect() as db:
+        db.execute("""CREATE TRIGGER fail_delivery BEFORE INSERT ON deliveries
+                    BEGIN SELECT RAISE(ABORT, 'delivery failed'); END""")
+
+    def propose(approval_service, reply_chunks):
+        return approval_service.propose_telegram_note(text, "chat", 37, key, NOW, reply_chunks)
+
+    with pytest.raises(sqlite3.IntegrityError, match="delivery failed"):
+        propose(service, lambda reply: [reply])
+    assert store.list_approvals("pending", now=NOW) == []
+    assert store.recent(10) == store.pending_deliveries() == []
+
+    with store._connect() as db:
+        db.execute("DROP TRIGGER fail_delivery")
+    proposal = propose(service, lambda reply: reply.splitlines())
+    assert proposal.payload == text
+    assert store.telegram_pending_notes("chat", NOW) == [(37, proposal.expires_at, proposal.id)]
+    row = store.by_update_key(key)
+    assert (row.kind, row.reason, row.request, row.items) == ("approval", "proposed", "", ())
+    assert store.pending_deliveries() == [(row.id, [
+        "메시지 37 · note.create · 1건", f"만료 {proposal.expires_at}", f"승인 ID {proposal.id}",
+    ], 0)]
+    store.mark_sent(row.id, 1)
+    reopened = Store.open(tmp_path)
+    assert propose(ApprovalService(reopened), lambda _: pytest.fail("reply regenerated")) is None
+    assert reopened.list_approvals("pending", now=NOW) == [proposal]
+    assert reopened.recent(10) == [row]
+    assert reopened.pending_deliveries() == store.pending_deliveries()
+    assert reopened.pending_deliveries()[0][2] == 1
+
+
+@pytest.mark.parametrize("approve", [True, False])
+def test_telegram_decision_rolls_back_when_delivery_save_fails(tmp_path, approve):
+    store = Store.open(tmp_path)
+    service = ApprovalService(store, {"note.create": lambda _: pytest.fail("executed before commit")})
+    proposal = service.propose("note.create", "draft", "chat", "telegram", NOW)
+    with store._connect() as db:
+        db.execute("""CREATE TRIGGER fail_delivery BEFORE INSERT ON deliveries
+                    BEGIN SELECT RAISE(ABORT, 'delivery failed'); END""")
+
+    with pytest.raises(sqlite3.IntegrityError, match="delivery failed"):
+        service.decide(proposal.id, "chat", "telegram", approve, NOW, "42:101", delivery=lambda status: [status])
+    assert store.get_approval(proposal.id) == proposal
+    assert store.recent(10) == store.pending_deliveries() == []
+
+    with store._connect() as db:
+        db.execute("DROP TRIGGER fail_delivery")
+    result = service.decide(proposal.id, "chat", "telegram", approve, NOW, "42:101", delivery=lambda status: [status])
+    assert result.status == ("claimed" if approve else "rejected")
+    other = service.propose("note.create", "other draft", "chat", "telegram", NOW)
+    replay = service.decide(
+        other.id, "chat", "telegram", False, NOW, "42:101", delivery=lambda _: pytest.fail("reply regenerated"),
+    )
+    assert replay == Decision("duplicate")
+    assert store.get_approval(other.id) == other
+    assert len(store.pending_deliveries()) == 1
+
+
 def test_decision_at_24_hour_boundary(tmp_path, service):
     early = service.propose("note.create", "early draft", "owner", "cli", NOW)
     late = service.propose("note.create", "late draft", "owner", "cli", NOW)

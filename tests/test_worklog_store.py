@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from worklog import Item, Record, Store
+from worklog.store import _MIGRATIONS
 
 
 SAMPLE = Record(
@@ -286,6 +287,42 @@ def test_listing_expires_only_due_pending_approvals(tmp_path, approval_fields):
     still_executing, = store.list_approvals("executing", now=deadline)
     assert still_executing.id == executing.id
     assert still_executing.payload == executing.payload
+
+
+def test_upgrade_v2_preserves_approval_history_and_partial_delivery(tmp_path, approval_fields):
+    path = tmp_path / "javis.db"
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        db.execute("INSERT INTO schema_version VALUES (2)")
+        for migration in _MIGRATIONS[:2]:
+            for statement in migration:
+                db.execute(statement)
+        db.execute(
+            """INSERT INTO approvals (id, kind, owner, allowed_channel, created_at, expires_at, payload, payload_hash)
+               VALUES ('legacy', :kind, :owner, :allowed_channel, :created_at, :expires_at, :payload, :payload_hash)""",
+            approval_fields | {"payload_hash": hashlib.sha256(approval_fields["payload"].encode()).hexdigest()},
+        )
+    old = Store(path)
+    record = replace(SAMPLE, channel="telegram", update_key="42:101")
+    record_id = old.save(record, chunks=["first", "second"])
+    old.mark_sent(record_id, 1)
+    old.set_offset(42)
+    offset = old.get_offset()
+
+    upgraded = Store.open(tmp_path)
+    assert upgraded.by_update_key("42:101") == replace(record, id=record_id)
+    assert upgraded.pending_deliveries() == [(record_id, ["first", "second"], 1)]
+    assert upgraded.get_offset() == offset
+    assert upgraded.get_approval("legacy").payload == approval_fields["payload"]
+    assert upgraded.telegram_pending_notes(approval_fields["owner"], datetime.fromisoformat(approval_fields["created_at"])) == []
+    upgraded.save_telegram_approval_reply("43:101", datetime.fromisoformat(record.created_at), "pending", ["reply"])
+    with upgraded._connect() as db:
+        assert db.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        row = db.execute("SELECT kind, reason FROM records WHERE update_key = '43:101'").fetchone()
+        assert tuple(row) == ("approval", "pending")
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("UPDATE deliveries SET record_id = -1 WHERE record_id = ?", (record_id,))
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem modes")

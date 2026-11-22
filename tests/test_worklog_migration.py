@@ -9,6 +9,7 @@ import pytest
 
 from tests.test_worklog_store import SAMPLE
 from worklog import Store
+from worklog.store import _SCHEMA_VERSION
 
 
 # Snapshot of the version 1 DDL, independent of Store.open and its migrations.
@@ -70,7 +71,11 @@ def v1_db(tmp_path):
 
 def assert_migrated(path, store):
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        assert db.execute("SELECT version FROM schema_version").fetchall() == [(_SCHEMA_VERSION,)]
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('approvals', 'telegram_note_proposals') ORDER BY name"
+        ).fetchall() == [("approvals",), ("telegram_note_proposals",)]
         assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
     assert store.get(V1_RECORD.id) == V1_RECORD
@@ -117,10 +122,11 @@ def test_migration_failure_rolls_back_and_can_be_retried(v1_db):
 
 
 def test_rejects_future_schema_version(v1_db):
+    future_version = _SCHEMA_VERSION + 1
     with closing(sqlite3.connect(v1_db)) as db, db:
-        db.execute("UPDATE schema_version SET version = 3")
+        db.execute("UPDATE schema_version SET version = ?", (future_version,))
     with pytest.raises(sqlite3.DatabaseError, match="unsupported worklog schema version"):
         Store.open(v1_db.parent)
     with closing(sqlite3.connect(v1_db)) as db:
-        assert db.execute("SELECT version FROM schema_version").fetchall() == [(3,)]
+        assert db.execute("SELECT version FROM schema_version").fetchall() == [(future_version,)]
         assert db.execute("SELECT name FROM sqlite_master WHERE name = 'approvals'").fetchall() == []

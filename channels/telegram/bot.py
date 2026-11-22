@@ -3,17 +3,19 @@
 import http.client
 import json
 import random
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request as HTTPRequest, build_opener
 
+from core.approval import ApprovalService, Executor
 from core.engine import Engine
 from core.gateway import Request, handle
-from worklog.store import Record, Store
+from worklog.store import ApprovalKind, Record, Store
 
 _API_BASE = "https://api.telegram.org"
 _POLL_TIMEOUT = 25
@@ -24,6 +26,19 @@ _CHUNK_LIMIT = 4000
 _DEFERRED_ID = 1000000000000000000
 _ID_FOOTER = f"\n\n기록 ID {_DEFERRED_ID}"
 _SAFE_ERROR = "응답을 처리하지 못했습니다."
+_APPROVAL_ID = re.compile(r"[0-9a-fA-F]{32}")
+_APPROVAL_USAGE = "사용법: 승인 대기 / 승인 <ID> / 거절 <ID>"
+_PC_ONLY = "brain.import는 PC에서만 확인하고 결정할 수 있습니다."
+_DECISION_REPLIES = {
+    "claimed": "승인을 접수했습니다.",
+    "rejected": "거절했습니다.",
+    "expired": "만료된 승인입니다.",
+    "not_found": "승인 ID를 찾을 수 없습니다.",
+    "forbidden": "이 승인을 결정할 수 없습니다.",
+    "already_decided": "이미 결정된 승인입니다.",
+    "pc_only": _PC_ONLY,
+    "executor_missing": "실행기 미등록 상태입니다.",
+}
 
 
 class TelegramError(Exception):
@@ -85,11 +100,13 @@ class TelegramBot:
         api_base: str = _API_BASE,
         now: Callable[[], datetime] = _local_now,
         sleep: Callable[[float], None] = time.sleep,
+        executors: Mapping[ApprovalKind, Executor] | None = None,
     ):
         self._token = token
         self._chat_id = chat_id
         self._store = store
         self._engine = engine
+        self._approvals = ApprovalService(store, executors)
         self._api_base = api_base.rstrip("/")
         self._now = now
         self._sleep = sleep
@@ -210,6 +227,48 @@ class TelegramBot:
             model=None, duration_s=None, ref_id=None, update_key=key,
         ))
 
+    def _approval_chunks(self, text: str) -> list[str]:
+        return [_SAFE_ERROR] if self._token in text else _reply_chunks(text + _ID_FOOTER)
+
+    def _handle_approval(self, message: dict, words: list[str], key: str) -> None:
+        now = self._now()
+        sender = message.get("from")
+        authorized = (
+            isinstance(sender, dict) and type(sender.get("id")) is int
+            and sender["id"] == self._chat_id and sender.get("is_bot") is False
+            and not any(field.startswith("forward_") for field in message)
+            and not message.get("is_automatic_forward")
+        )
+        if not authorized:
+            self._store.save_telegram_approval_reply(key, now, "forbidden", self._approval_chunks(
+                "승인 명령은 설정된 개인 채팅에서 소유자가 직접 보낸 메시지만 처리합니다.",
+            ))
+        elif words == ["승인", "대기"]:
+            notes = self._store.telegram_pending_notes(str(self._chat_id), now)
+            lines = [f"승인 대기 {len(notes)}건"]
+            lines.extend(
+                f"메시지 {message_id} · note.create · 1건\n만료 {expires_at}\n승인 ID {id}"
+                for message_id, expires_at, id in notes
+            )
+            lines.append(_PC_ONLY)
+            self._store.save_telegram_approval_reply(key, now, "pending", self._approval_chunks("\n\n".join(lines)))
+        elif len(words) != 2 or not _APPROVAL_ID.fullmatch(words[1]):
+            self._store.save_telegram_approval_reply(key, now, "invalid_arguments", self._approval_chunks(_APPROVAL_USAGE))
+        else:
+            result = self._approvals.decide(
+                words[1].lower(), str(self._chat_id), "telegram", words[0] == "승인", now, key,
+                delivery=lambda status: self._approval_chunks(_DECISION_REPLIES[status]),
+            )
+            claim = result.approval
+            if claim is not None:
+                try:
+                    ok = self._approvals.executors[claim.kind](claim)
+                    self._approvals.finish(claim.id, ok)
+                except Exception:
+                    # The executor may have published its result. Keep the claim for local recovery.
+                    pass
+        self._resume_deliveries()
+
     def _handle_update(self, update) -> None:
         if not isinstance(update, dict):
             return
@@ -225,21 +284,27 @@ class TelegramBot:
 
         key = f"{update_id}:{date}"
         if self._store.by_update_key(key) is not None:
+            self._resume_deliveries()
             self._advance(offset)
             return
         chat = message.get("chat")
-        if (not isinstance(chat, dict) or chat.get("type") != "private"
-                or type(chat.get("id")) is not int or chat["id"] != self._chat_id):
+        private_owner_chat = (isinstance(chat, dict) and chat.get("type") == "private"
+                              and type(chat.get("id")) is int and chat["id"] == self._chat_id)
+        text = message.get("text")
+        words = text.split() if isinstance(text, str) else []
+        if not private_owner_chat:
             self._deny(key)
             self._advance(offset)
             return
-        text = message.get("text")
-        if not isinstance(text, str) or not text.strip():
+        if not words:
             self._advance(offset)
             return
         if self._token in text:
             self._deny(key)
             self._advance(offset)
+            return
+        if words[0] in {"승인", "거절"}:
+            self._handle_approval(message, words, key)
             return
 
         staged = _DeferredSave(self._store)

@@ -6,7 +6,7 @@ import os
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -25,7 +25,7 @@ class Record:
     id: int | None
     created_at: str
     channel: str
-    kind: Literal["ask", "recall"]
+    kind: Literal["ask", "recall", "approval"]
     request: str
     items: tuple[Item, ...]
     status: Literal["ok", "error", "timeout", "quota", "denied"]
@@ -39,7 +39,10 @@ class Record:
 
 ApprovalKind = Literal["note.create", "brain.import"]
 ApprovalStatus = Literal["pending", "executing", "done", "failed", "rejected", "expired"]
-DecisionStatus = Literal["claimed", "rejected", "expired", "not_found", "forbidden", "already_decided"]
+DecisionStatus = Literal[
+    "claimed", "rejected", "expired", "not_found", "forbidden", "already_decided",
+    "pc_only", "executor_missing", "duplicate",
+]
 
 
 @dataclass(frozen=True)
@@ -141,7 +144,54 @@ _MIGRATE_V1_TO_V2 = (
     """,
 )
 
-_MIGRATIONS = (_SCHEMA_V1, _MIGRATE_V1_TO_V2)
+_MIGRATE_V2_TO_V3 = (
+    """
+    CREATE TABLE records_v3 (
+        id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        created_utc TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('ask', 'recall', 'approval')),
+        request TEXT NOT NULL,
+        items TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ok', 'error', 'timeout', 'quota', 'denied')),
+        reason TEXT,
+        engine TEXT,
+        model TEXT,
+        duration_s REAL,
+        ref_id INTEGER,
+        update_key TEXT UNIQUE
+    )
+    """,
+    "INSERT INTO records_v3 SELECT * FROM records",
+    # Rebuild the child table so foreign key enforcement can stay enabled.
+    """
+    CREATE TABLE deliveries_v3 (
+        record_id INTEGER PRIMARY KEY REFERENCES records_v3 (id),
+        chunks TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL,
+        next_index INTEGER NOT NULL DEFAULT 0 CHECK (next_index BETWEEN 0 AND chunk_count),
+        failure_reason TEXT
+    )
+    """,
+    "INSERT INTO deliveries_v3 SELECT * FROM deliveries",
+    "DROP TABLE deliveries",
+    "DROP TABLE records",
+    "ALTER TABLE records_v3 RENAME TO records",
+    "ALTER TABLE deliveries_v3 RENAME TO deliveries",
+    "CREATE INDEX records_created ON records (created_utc, id)",
+    """
+    CREATE INDEX records_ok_asks ON records (created_utc, id)
+    WHERE kind = 'ask' AND status = 'ok'
+    """,
+    """
+    CREATE TABLE telegram_note_proposals (
+        approval_id TEXT PRIMARY KEY NOT NULL REFERENCES approvals (id),
+        message_id INTEGER NOT NULL CHECK (message_id > 0)
+    )
+    """,
+)
+_MIGRATIONS = (_SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3)
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
 
@@ -231,34 +281,62 @@ class Store:
 
     def save(self, record: Record, *, chunks: list[str] | None = None) -> int:
         """Save a record and any initial delivery together. The DB assigns the ID."""
+        with self._connect() as db:
+            return self._save(db, record, chunks)
+
+    def _save(self, db: sqlite3.Connection, record: Record, chunks: list[str] | None) -> int:
         created_at = _utc_timestamp(record.created_at, "created_at")
         created_utc = created_at.astimezone(UTC).isoformat(timespec="microseconds")
         items = json.dumps([(item.text, item.sources) for item in record.items])
+        inserted = db.execute(
+            """
+            INSERT INTO records (
+                created_at, created_utc, channel, kind, request, items, status,
+                reason, engine, model, duration_s, ref_id, update_key
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (update_key) DO NOTHING
+            RETURNING id
+            """,
+            (
+                record.created_at, created_utc, record.channel, record.kind,
+                record.request, items, record.status, record.reason, record.engine,
+                record.model, record.duration_s, record.ref_id, record.update_key,
+            ),
+        ).fetchone()
+        if inserted is None:
+            return db.execute(
+                "SELECT id FROM records WHERE update_key = ?", (record.update_key,)
+            ).fetchone()["id"]
+        record_id = inserted["id"]
+        if chunks is not None:
+            self._set_delivery(db, record_id, chunks)
+        return record_id
+
+    def save_telegram_approval_reply(
+        self, key: str, now: datetime, outcome: str, chunks: list[str],
+    ) -> None:
         with self._connect() as db:
-            inserted = db.execute(
-                """
-                INSERT INTO records (
-                    created_at, created_utc, channel, kind, request, items, status,
-                    reason, engine, model, duration_s, ref_id, update_key
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (update_key) DO NOTHING
-                RETURNING id
-                """,
-                (
-                    record.created_at, created_utc, record.channel, record.kind,
-                    record.request, items, record.status, record.reason, record.engine,
-                    record.model, record.duration_s, record.ref_id, record.update_key,
-                ),
-            ).fetchone()
-            if inserted is None:
-                return db.execute(
-                    "SELECT id FROM records WHERE update_key = ?", (record.update_key,)
-                ).fetchone()["id"]
-            record_id = inserted["id"]
-            if chunks is not None:
-                self._set_delivery(db, record_id, chunks)
-            return record_id
+            self._save_telegram_approval_reply(db, key, now, outcome, chunks)
+
+    def _save_telegram_approval_reply(
+        self, db: sqlite3.Connection, key: str, now: datetime | None, outcome: str, chunks: list[str],
+    ) -> None:
+        if not chunks:
+            raise ValueError("an approval reply requires at least one delivery chunk")
+        if outcome in {"proposed", "pending", "claimed", "rejected"}:
+            status = "ok"
+        else:
+            status = "denied" if outcome == "forbidden" else "error"
+        self._save(db, Record(
+            id=None, created_at=_approval_time(now), channel="telegram", kind="approval",
+            request="", items=(), status=status,
+            reason=outcome, engine=None, model=None, duration_s=None, ref_id=None, update_key=key,
+        ), chunks)
+
+    @staticmethod
+    def _has_update(db: sqlite3.Connection, key: str) -> bool:
+        return db.execute("SELECT 1 FROM records WHERE update_key = ?", (key,)).fetchone() is not None
 
     def create_approval(
         self,
@@ -271,27 +349,56 @@ class Store:
         payload: str,
     ) -> Approval:
         """Store a pending approval and hash the exact UTF-8 execution payload."""
+        with self._connect() as db:
+            return self._create_approval(db, kind, owner, allowed_channel, created_at, expires_at, payload)
+
+    @staticmethod
+    def _create_approval(
+        db: sqlite3.Connection, kind: ApprovalKind, owner: str, allowed_channel: str,
+        created_at: str, expires_at: str, payload: str,
+    ) -> Approval:
         created = _utc_timestamp(created_at, "created_at")
         expires = _utc_timestamp(expires_at, "expires_at")
         if expires <= created:
             raise ValueError("expires_at must be after created_at")
-        with self._connect() as db:
-            row = db.execute(
-                """
-                INSERT INTO approvals (
-                    id, kind, owner, allowed_channel, created_at, expires_at, payload, payload_hash
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                RETURNING *
-                """,
-                (
-                    secrets.token_hex(16), kind, owner, allowed_channel,
-                    created.isoformat(timespec="microseconds"),
-                    expires.isoformat(timespec="microseconds"),
-                    payload, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-                ),
-            ).fetchone()
+        row = db.execute(
+            """
+            INSERT INTO approvals (
+                id, kind, owner, allowed_channel, created_at, expires_at, payload, payload_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING *
+            """,
+            (
+                secrets.token_hex(16), kind, owner, allowed_channel,
+                created.isoformat(timespec="microseconds"),
+                expires.isoformat(timespec="microseconds"),
+                payload, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            ),
+        ).fetchone()
         return Approval(**dict(row))
+
+    def create_telegram_note_proposal(
+        self, *, owner: str, message_id: int, update_key: str, now: datetime, payload: str,
+        delivery: Callable[[str, str], list[str]],
+    ) -> Approval | None:
+        """Commit the proposal and its delivery once per update. A replay uses the saved delivery."""
+        if type(message_id) is not int or not 0 < message_id < 2**63 or not update_key:
+            raise ValueError("a Telegram message ID and processing key are required")
+        created = _approval_time(now)
+        expires = (datetime.fromisoformat(created) + timedelta(hours=24)).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._has_update(db, update_key):
+                return None
+            approval = self._create_approval(db, "note.create", owner, "telegram", created, expires, payload)
+            db.execute(
+                "INSERT INTO telegram_note_proposals (approval_id, message_id) VALUES (?, ?)",
+                (approval.id, message_id),
+            )
+            chunks = delivery(approval.id, approval.expires_at)
+            self._save_telegram_approval_reply(db, update_key, now, "proposed", chunks)
+            return approval
 
     def get_approval(self, id: str) -> Approval | None:
         with self._connect() as db:
@@ -313,6 +420,21 @@ class Store:
             ).fetchall()
         return [Approval(**dict(row)) for row in rows]
 
+    def telegram_pending_notes(self, owner: str, now: datetime) -> list[tuple[int, str, str]]:
+        """Return message ID, expiry, and approval ID for this chat's pending notes."""
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT message_id, expires_at, id FROM approvals
+                JOIN telegram_note_proposals ON approval_id = id
+                WHERE status = 'pending' AND allowed_channel = 'telegram' AND owner = ?
+                    AND kind = 'note.create' AND expires_at > ?
+                ORDER BY created_at, id
+                """,
+                (owner, _approval_time(now)),
+            ).fetchall()
+        return [(row[0], row[1], row[2]) for row in rows]
+
     def decide_approval(
         self,
         id: str,
@@ -323,58 +445,81 @@ class Store:
         now: datetime | None = None,
         update_key: str | None = None,
         executor: tuple[int, str] | None = None,
+        available_kinds: Collection[ApprovalKind] | None = None,
+        delivery: Callable[[DecisionStatus], list[str]] | None = None,
     ) -> Decision:
         if approve and executor is None:
             raise ValueError("approval requires an executor identity")
+        if delivery is not None and (channel != "telegram" or not update_key):
+            raise ValueError("a Telegram delivery requires a processing key")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM approvals WHERE id = ?", (id,)).fetchone()
-            if row is None:
-                return Decision("not_found")
-            if row["owner"] != actor or row["allowed_channel"] != channel:
-                return Decision("forbidden")
-            if row["status"] == "expired":
-                return Decision("expired")
-            if row["status"] != "pending":
-                return Decision("already_decided")
+            if delivery is not None and update_key is not None and self._has_update(db, update_key):
+                return Decision("duplicate")
+            decision = self._decide_approval(
+                db, id, actor, channel, approve, now, update_key, executor, available_kinds,
+            )
+            if delivery is not None and update_key is not None:
+                self._save_telegram_approval_reply(db, update_key, now, decision.status, delivery(decision.status))
+            return decision
 
-            payload = row["payload"]
-            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest() if isinstance(payload, str) else None
-            timestamp = _approval_time(now)
-            if row["expires_at"] <= timestamp:
-                updated = db.execute(
-                    """
-                    UPDATE approvals SET status = 'expired', payload = NULL, payload_hash = NULL,
-                        decision_update_key = ?
-                    WHERE id = ? AND status = 'pending' AND expires_at <= ?
-                    """,
-                    (update_key, id, timestamp),
-                )
-                if updated.rowcount == 1:
-                    return Decision("expired")
-                raise sqlite3.DatabaseError("approval expiration did not update one row")
-            if digest is None or digest != row["payload_hash"]:
-                return Decision("forbidden")
+    @staticmethod
+    def _decide_approval(
+        db: sqlite3.Connection, id: str, actor: str, channel: str, approve: bool,
+        now: datetime | None, update_key: str | None, executor: tuple[int, str] | None,
+        available_kinds: Collection[ApprovalKind] | None,
+    ) -> Decision:
+        row = db.execute("SELECT * FROM approvals WHERE id = ?", (id,)).fetchone()
+        if row is None:
+            return Decision("not_found")
+        if channel == "telegram" and row["kind"] == "brain.import":
+            return Decision("pc_only")
+        if row["owner"] != actor or row["allowed_channel"] != channel:
+            return Decision("forbidden")
+        if row["status"] == "expired":
+            return Decision("expired")
+        if row["status"] != "pending":
+            return Decision("already_decided")
 
-            pid, started_at = executor if approve else (None, None)
+        payload = row["payload"]
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest() if isinstance(payload, str) else None
+        timestamp = _approval_time(now)
+        if row["expires_at"] <= timestamp:
             updated = db.execute(
                 """
-                UPDATE approvals SET status = ?, executor_pid = ?, executor_started_at = ?,
-                    decision_update_key = ?, payload = CASE WHEN ? THEN payload END,
-                    payload_hash = CASE WHEN ? THEN payload_hash END
-                WHERE id = ? AND status = 'pending' AND owner = ? AND allowed_channel = ?
-                    AND payload_hash = ? AND expires_at > ?
-                RETURNING *
+                UPDATE approvals SET status = 'expired', payload = NULL, payload_hash = NULL,
+                    decision_update_key = ?
+                WHERE id = ? AND status = 'pending' AND expires_at <= ?
                 """,
-                (
-                    "executing" if approve else "rejected", pid, started_at, update_key,
-                    approve, approve, id, actor, channel, digest, timestamp,
-                ),
+                (update_key, id, timestamp),
             )
-            rows = updated.fetchall()
-            if updated.rowcount != 1:
-                raise sqlite3.DatabaseError("approval decision did not update one row")
-            return Decision("claimed", Approval(**dict(rows[0]))) if approve else Decision("rejected")
+            if updated.rowcount == 1:
+                return Decision("expired")
+            raise sqlite3.DatabaseError("approval expiration did not update one row")
+        if digest is None or digest != row["payload_hash"]:
+            return Decision("forbidden")
+        if approve and available_kinds is not None and row["kind"] not in available_kinds:
+            return Decision("executor_missing")
+
+        pid, started_at = executor if approve else (None, None)
+        updated = db.execute(
+            """
+            UPDATE approvals SET status = ?, executor_pid = ?, executor_started_at = ?,
+                decision_update_key = ?, payload = CASE WHEN ? THEN payload END,
+                payload_hash = CASE WHEN ? THEN payload_hash END
+            WHERE id = ? AND status = 'pending' AND owner = ? AND allowed_channel = ?
+                AND payload_hash = ? AND expires_at > ?
+            RETURNING *
+            """,
+            (
+                "executing" if approve else "rejected", pid, started_at, update_key,
+                approve, approve, id, actor, channel, digest, timestamp,
+            ),
+        )
+        rows = updated.fetchall()
+        if updated.rowcount != 1:
+            raise sqlite3.DatabaseError("approval decision did not update one row")
+        return Decision("claimed", Approval(**dict(rows[0]))) if approve else Decision("rejected")
 
     def finish_approval(self, id: str, *, ok: bool, executor: tuple[int, str]) -> bool:
         with self._connect() as db:

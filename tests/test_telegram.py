@@ -7,7 +7,9 @@ from threading import Thread
 import pytest
 
 from channels.telegram.bot import TelegramBot, TelegramError
+from channels.telegram import bot as telegram
 from core import cli
+from core.approval import ApprovalService
 from core.config import EngineSettings
 from core.engine import ClaudeEngine, EngineResult
 from worklog.store import Item, Store
@@ -357,3 +359,144 @@ def test_serve_uses_environment_and_local_settings(monkeypatch, tmp_path, capsys
     assert cli.main(["serve"]) == status
     assert [name for _, name in looked_up] == ["JAVIS_TELEGRAM_CHAT_ID"]
     assert capsys.readouterr().err == ("Telegram 401\n" if status else "")
+
+
+def owner_update(id, text, *, sender=CHAT, is_bot=False, **extra):
+    return update(id=id, text=text, **{"from": {"id": sender, "is_bot": is_bot}}, **extra)
+
+
+def test_approval_requires_direct_human_owner_in_private_chat(api, store, monkeypatch):
+    now = datetime.now(UTC)
+    proposal = ApprovalService(store).propose("note.create", "draft", str(CHAT), "telegram", now)
+    command = f"승인 {proposal.id}"
+    monkeypatch.setattr(ApprovalService, "decide", lambda *args, **kwargs: pytest.fail("decision called"))
+    api.updates(
+        owner_update(40, command, sender=CHAT + 1),
+        owner_update(41, command, is_bot=True),
+        owner_update(42, command, forward_origin={}),
+        owner_update(43, command, forward_from={}),
+        owner_update(44, command, forward_date=100),
+        owner_update(45, command, is_automatic_forward=True),
+        update(id=48, text=command),
+    )
+    for _ in range(7):
+        api.reply()
+    engine = FakeEngine()
+    bot(api, store, engine).poll_once()
+    assert engine.calls == []
+    assert store.get_approval(proposal.id) == proposal
+    assert len(api.sent()) == 7
+    assert all(reply["chat_id"] == CHAT and "설정된 개인 채팅" in reply["text"] for reply in api.sent())
+    assert all(row.status == "denied" and row.request == "" for row in store.recent(10))
+
+
+def test_approval_from_other_chats_is_recorded_without_reply(api, store, monkeypatch):
+    now = datetime.now(UTC)
+    proposal = ApprovalService(store).propose("note.create", "draft", str(CHAT), "telegram", now)
+    monkeypatch.setattr(ApprovalService, "decide", lambda *args, **kwargs: pytest.fail("decision called"))
+    api.updates(
+        owner_update(40, f"승인 {proposal.id}", chat=CHAT + 1),
+        owner_update(41, f"거절 {proposal.id}", kind="group"),
+    )
+    engine = FakeEngine()
+    bot(api, store, engine).poll_once()
+
+    assert engine.calls == api.sent() == store.pending_deliveries() == []
+    assert store.get_approval(proposal.id) == proposal
+    assert store.get_offset()[0] == 42
+    rows = store.recent(10)
+    assert {row.update_key for row in rows} == {"40:101", "41:101"}
+    assert all(row.status == "denied" and row.request == "" for row in rows)
+
+
+def test_approval_replay_resumes_committed_decision_reply(api, store, tmp_path, monkeypatch):
+    now = datetime.now(UTC)
+    proposal = ApprovalService(store).propose("note.create", "private draft", str(CHAT), "telegram", now)
+    decisions = []
+    executions = []
+    decide = ApprovalService.decide
+
+    def count_decision(self, *args, **kwargs):
+        decisions.append(args[0])
+        return decide(self, *args, **kwargs)
+
+    def execute(claim):
+        assert store.get_approval(claim.id) == claim
+        assert store.by_update_key("40:101").reason == "claimed"
+        assert store.pending_deliveries()[0][2] == 0
+        executions.append(claim.payload)
+        return True
+
+    def interrupted(_delay):
+        assert store.pending_deliveries()[0][2] == 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ApprovalService, "decide", count_decision)
+    monkeypatch.setattr(telegram, "_CHUNK_LIMIT", len(telegram._ID_FOOTER))
+    engine = FakeEngine()
+    item = owner_update(40, f"승인 {proposal.id.upper()}")
+    options = {"now": lambda: now, "executors": {"note.create": execute}}
+    api.updates(item)
+    api.reply()
+    api.add("sendMessage", 503)
+    with pytest.raises(KeyboardInterrupt):
+        bot(api, store, engine, sleep=interrupted, **options).poll_once()
+    assert store.get_offset() is None
+
+    api.reply()
+    api.updates(item, item)
+    reopened = Store.open(tmp_path)
+    bot(api, reopened, engine, **options).poll_once()
+    assert [request["text"] for request in api.sent()] == ["승인을 접수했습니다.", "\n\n기록 ID 1", "\n\n기록 ID 1"]
+    assert api.polls()[-1]["offset"] == reopened.get_offset()[0] == 41
+    assert reopened.pending_deliveries() == []
+    finished = reopened.get_approval(proposal.id)
+    assert (finished.status, finished.decision_update_key, finished.payload) == ("done", "40:101", None)
+    assert decisions == [proposal.id] and executions == ["private draft"] and engine.calls == []
+
+
+def test_pending_and_decisions_are_local_and_scope_limited(api, store):
+    now = datetime.now(UTC)
+    owner = str(CHAT)
+    service = ApprovalService(store)
+    note = service.propose_telegram_note("phone draft", owner, 81, "1:101", now, lambda text: [text])
+    other = service.propose_telegram_note("other draft", "other", 82, "2:101", now, lambda text: [text])
+    expired = service.propose_telegram_note(
+        "expired draft", owner, 83, "3:101", now - timedelta(days=1), lambda text: [text],
+    )
+    local = service.propose("note.create", "local draft", owner, "cli", now)
+    imported = service.propose("brain.import", {"files": ["private.md"]}, owner, "cli", now)
+    for id, chunks, _ in store.pending_deliveries():
+        store.mark_sent(id, len(chunks))
+    api.updates(
+        owner_update(40, "승인 대기"),
+        owner_update(41, f"승인 {imported.id}"),
+        owner_update(42, f"거절 {imported.id}"),
+        owner_update(43, "승인"),
+        owner_update(44, f"승인 {note.id} extra"),
+        owner_update(45, "거절 malformed"),
+        owner_update(46, f"승인 {note.id}"),
+        owner_update(47, f"거절 {note.id}"),
+    )
+    for _ in range(8):
+        api.reply()
+    engine = FakeEngine()
+    bot(api, store, engine, now=lambda: now, executors={
+        "brain.import": lambda _: pytest.fail("import executed on phone"),
+    }).poll_once()
+    pending, approve_import, reject_import, *invalid, missing, rejected = [reply["text"] for reply in api.sent()]
+    for text in ("승인 대기 1건", "메시지 81", "note.create", note.expires_at, note.id):
+        assert text in pending
+    for text in (other.id, local.id, imported.id, expired.id, "phone draft", "메시지 82", "private.md"):
+        assert text not in pending
+    assert all("PC에서만" in reply for reply in (pending, approve_import, reject_import))
+    assert len(invalid) == 3 and all("사용법" in reply for reply in invalid)
+    assert "미등록" in missing and "거절했습니다" in rejected
+    assert [store.by_update_key(f"{id}:101").reason for id in range(40, 48)] == [
+        "pending", "pc_only", "pc_only", "invalid_arguments", "invalid_arguments", "invalid_arguments",
+        "executor_missing", "rejected",
+    ]
+    assert store.get_approval(imported.id) == imported
+    assert store.get_approval(note.id).decision_update_key == "47:101"
+    assert store.get_approval(note.id).status == "rejected"
+    assert engine.calls == []

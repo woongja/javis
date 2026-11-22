@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from worklog import Approval, ApprovalKind, Decision, Store
+from worklog.store import DecisionStatus
 
 
 def _note_payload(payload: object) -> str:
@@ -55,12 +56,26 @@ class ApprovalService:
 
     def decide(
         self, id: str, actor: str, channel: str, approve: bool, now: datetime | None = None,
-        update_key: str | None = None,
+        update_key: str | None = None, *, delivery: Callable[[DecisionStatus], list[str]] | None = None,
     ) -> Decision:
         """Return the stored execution payload only to the caller that claimed it."""
         return self._store.decide_approval(
             id, actor=actor, channel=channel, approve=approve, now=now,
             update_key=update_key, executor=_executor_identity() if approve else None,
+            available_kinds=self.executors.keys() if delivery is not None else None, delivery=delivery,
+        )
+
+    def propose_telegram_note(
+        self, text: str, owner: str, message_id: int, update_key: str, now: datetime,
+        reply_chunks: Callable[[str], list[str]],
+    ) -> Approval | None:
+        """Save a phone note draft and queue a reply containing only approval metadata."""
+        def delivery(id: str, expires_at: str) -> list[str]:
+            return reply_chunks(f"메시지 {message_id} · note.create · 1건\n만료 {expires_at}\n승인 ID {id}")
+
+        return self._store.create_telegram_note_proposal(
+            owner=owner, message_id=message_id, update_key=update_key, now=now,
+            payload=_note_payload(text), delivery=delivery,
         )
 
     def finish(self, id: str, ok: bool) -> bool:
