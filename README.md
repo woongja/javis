@@ -9,10 +9,13 @@ The development harness is complete. Assistant phase 1 provides a CLI and a
 Telegram channel, powered by Claude Code through your subscription login.
 Both use a local worklog with source recall.
 
+Phase 2 adds local Obsidian search, note approvals, Markdown import, worklog
+search, a local HUD, and optional voice input and output.
+
 ## Use javis
 
-Run these from the checkout with `claude` on your PATH and signed in to your
-Claude subscription.
+Use `uv run javis` from the checkout or `javis` after installing the wheel.
+Web questions require `claude` on your PATH and a Claude subscription login.
 
 ```sh
 uv run javis ask "<question>"
@@ -31,6 +34,69 @@ sources for that answer. The same recall phrases work as bot messages.
 The local SQLite worklog holds private requests and answers. Keep it outside
 the repository. It defaults to `~/.javis`. To use a different folder, set
 `JAVIS_DATA_DIR` in the shell environment before running javis.
+
+### Brain and approvals
+
+Set `JAVIS_BRAIN_DIR=<vault>` in the checkout's `.env` to use your Obsidian
+vault. Run brain searches on the PC. Results stay on the PC.
+
+```sh
+uv run javis ask "/brain 검색어"
+uv run javis ask "/note 본문"
+uv run javis pending
+uv run javis approve <ID>
+uv run javis reject <ID>
+```
+
+Approving a note creates one new Markdown file in `javis/inbox/`. To further
+restrict writes, put a UTF-8 `BRAIN.md` at the vault root with one allowed
+relative directory per line, such as `javis/inbox` or `imports`. Without
+`BRAIN.md`, writes are limited to the inbox and the approved import destination.
+
+### Import Markdown
+
+```sh
+uv run javis brain import "<external-vault-subfolder>" --dest "<relative-path>"
+uv run javis approve <ID>
+```
+
+Review the preview before approving on the PC. The import skips hidden files
+and folders, non-Markdown files, links, and destination conflicts. Source
+files stay as they are.
+
+### Search and HUD
+
+```sh
+uv run javis search 단어
+uv run javis ask "출처 <ID>"
+uv run javis hud
+```
+
+On your phone, send `기록 검색 단어` to the bot and use `출처 <ID>` to
+recall sources for a matching result. For the HUD, open the address printed
+in the terminal and enter the one-time code. The HUD listens only on
+`127.0.0.1`.
+
+### Voice
+
+Voice is off by default. To enable local text-to-speech, add this to
+`settings.toml` in your javis data folder.
+
+```toml
+[voice]
+enabled = true
+tts = true
+stt = false
+tts_provider = "local"
+stt_provider = "none"
+```
+
+Set `ELEVENLABS_API_KEY` in `.env` to use ElevenLabs. For text-to-speech,
+set `tts_provider = "elevenlabs"` and add `ELEVENLABS_VOICE_ID` to `.env`.
+For Telegram transcription, set `stt = true` and `stt_provider = "elevenlabs"`.
+**External transcription sends the original voice recording to ElevenLabs.**
+Transcripts are drafts for you to review. Send any command separately as text.
+Check your settings with `uv run javis voice status`.
 
 ## Telegram setup
 
@@ -54,6 +120,9 @@ the repository. It defaults to `~/.javis`. To use a different folder, set
    restart it with the same data folder, and send `출처 <ID> 1` with that
    answer ID. Check that the link matches.
 
+To manage note approvals from your phone, send `승인 대기`, `승인 <ID>`, or
+`거절 <ID>` to the bot. Imports and their approvals are PC-only.
+
 ## Troubleshooting
 
 - If `serve` prints `JAVIS_TELEGRAM_TOKEN` or `JAVIS_TELEGRAM_CHAT_ID`, fill in
@@ -69,7 +138,7 @@ the repository. It defaults to `~/.javis`. To use a different folder, set
 
 ## Development quick start (Windows or macOS)
 ```
-git clone https://github.com/woongja/javis.git && cd javis
+git clone <repository-url> javis && cd javis
 uv run harness doctor --fix --probe
 uv run pytest -q
 ```
