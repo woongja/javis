@@ -39,6 +39,7 @@ class Record:
 
 ApprovalKind = Literal["note.create", "brain.import"]
 ApprovalStatus = Literal["pending", "executing", "done", "failed", "rejected", "expired"]
+DecisionStatus = Literal["claimed", "rejected", "expired", "not_found", "forbidden", "already_decided"]
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,12 @@ class Approval:
     executor_pid: int | None
     executor_started_at: str | None
     decision_update_key: str | None
+
+
+@dataclass(frozen=True)
+class Decision:
+    status: DecisionStatus
+    approval: Approval | None = None  # Present only for a committed claim.
 
 
 _BUSY_TIMEOUT = 5.0
@@ -143,6 +150,13 @@ def _utc_timestamp(value: str, name: str) -> datetime:
     if timestamp.utcoffset() != timedelta(0):
         raise ValueError(f"{name} must be a UTC ISO 8601 timestamp")
     return timestamp
+
+
+def _approval_time(now: datetime | None) -> str:
+    now = datetime.now(UTC) if now is None else now
+    if now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 def _restrict_database_permissions(path: Path) -> None:
@@ -284,12 +298,95 @@ class Store:
             row = db.execute("SELECT * FROM approvals WHERE id = ?", (id,)).fetchone()
         return Approval(**dict(row)) if row is not None else None
 
-    def list_approvals(self, status: ApprovalStatus) -> list[Approval]:
+    def list_approvals(self, status: ApprovalStatus, *, now: datetime | None = None) -> list[Approval]:
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                UPDATE approvals SET status = 'expired', payload = NULL, payload_hash = NULL
+                WHERE status = 'pending' AND expires_at <= ?
+                """,
+                (_approval_time(now),),
+            )
             rows = db.execute(
                 "SELECT * FROM approvals WHERE status = ? ORDER BY created_at, id", (status,)
             ).fetchall()
         return [Approval(**dict(row)) for row in rows]
+
+    def decide_approval(
+        self,
+        id: str,
+        *,
+        actor: str,
+        channel: str,
+        approve: bool,
+        now: datetime | None = None,
+        update_key: str | None = None,
+        executor: tuple[int, str] | None = None,
+    ) -> Decision:
+        if approve and executor is None:
+            raise ValueError("approval requires an executor identity")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM approvals WHERE id = ?", (id,)).fetchone()
+            if row is None:
+                return Decision("not_found")
+            if row["owner"] != actor or row["allowed_channel"] != channel:
+                return Decision("forbidden")
+            if row["status"] == "expired":
+                return Decision("expired")
+            if row["status"] != "pending":
+                return Decision("already_decided")
+
+            payload = row["payload"]
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest() if isinstance(payload, str) else None
+            timestamp = _approval_time(now)
+            if row["expires_at"] <= timestamp:
+                updated = db.execute(
+                    """
+                    UPDATE approvals SET status = 'expired', payload = NULL, payload_hash = NULL,
+                        decision_update_key = ?
+                    WHERE id = ? AND status = 'pending' AND expires_at <= ?
+                    """,
+                    (update_key, id, timestamp),
+                )
+                if updated.rowcount == 1:
+                    return Decision("expired")
+                raise sqlite3.DatabaseError("approval expiration did not update one row")
+            if digest is None or digest != row["payload_hash"]:
+                return Decision("forbidden")
+
+            pid, started_at = executor if approve else (None, None)
+            updated = db.execute(
+                """
+                UPDATE approvals SET status = ?, executor_pid = ?, executor_started_at = ?,
+                    decision_update_key = ?, payload = CASE WHEN ? THEN payload END,
+                    payload_hash = CASE WHEN ? THEN payload_hash END
+                WHERE id = ? AND status = 'pending' AND owner = ? AND allowed_channel = ?
+                    AND payload_hash = ? AND expires_at > ?
+                RETURNING *
+                """,
+                (
+                    "executing" if approve else "rejected", pid, started_at, update_key,
+                    approve, approve, id, actor, channel, digest, timestamp,
+                ),
+            )
+            rows = updated.fetchall()
+            if updated.rowcount != 1:
+                raise sqlite3.DatabaseError("approval decision did not update one row")
+            return Decision("claimed", Approval(**dict(rows[0]))) if approve else Decision("rejected")
+
+    def finish_approval(self, id: str, *, ok: bool, executor: tuple[int, str]) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute(
+                """
+                UPDATE approvals SET status = ?, payload = NULL, payload_hash = NULL
+                WHERE id = ? AND status = 'executing' AND executor_pid = ? AND executor_started_at = ?
+                """,
+                ("done" if ok else "failed", id, *executor),
+            )
+            return updated.rowcount == 1
 
     def get(self, id: int) -> Record | None:
         with self._connect() as db:

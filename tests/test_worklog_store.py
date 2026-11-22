@@ -241,8 +241,9 @@ def test_approval_round_trip_is_private(tmp_path, approval_fields):
     reopened = Store.open(tmp_path)
     assert reopened.get_approval(first.id) == first
     assert reopened.get_approval("missing") is None
-    assert reopened.list_approvals("pending") == [first, second]
-    assert reopened.list_approvals("done") == []
+    now = datetime.fromisoformat(second.created_at)
+    assert reopened.list_approvals("pending", now=now) == [first, second]
+    assert reopened.list_approvals("done", now=now) == []
     assert reopened.recent(10) == []
     assert reopened.pending_deliveries() == []
 
@@ -265,6 +266,26 @@ def test_approval_constraints(tmp_path, approval_fields):
                 (approval.id,),
             )
     assert store.get_approval(approval.id) == approval
+
+
+def test_listing_expires_only_due_pending_approvals(tmp_path, approval_fields):
+    store = Store.open(tmp_path)
+    due = store.create_approval(**approval_fields)
+    later = store.create_approval(**(approval_fields | {"expires_at": "2026-11-23T12:00:01Z"}))
+    executing = store.create_approval(**approval_fields)
+    deadline = datetime.fromisoformat(due.expires_at)
+    assert store.decide_approval(
+        executing.id, actor=executing.owner, channel=executing.allowed_channel,
+        approve=True, now=deadline - timedelta(microseconds=1), executor=(123, "start"),
+    ).status == "claimed"
+
+    assert store.list_approvals("pending", now=deadline) == [later]
+    expired, = store.list_approvals("expired", now=deadline)
+    assert expired.id == due.id
+    assert expired.payload is expired.payload_hash is None
+    still_executing, = store.list_approvals("executing", now=deadline)
+    assert still_executing.id == executing.id
+    assert still_executing.payload == executing.payload
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem modes")
