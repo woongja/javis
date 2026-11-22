@@ -9,6 +9,7 @@ import pytest
 
 from core import approval, cli
 from core.approval import ApprovalService
+from core.note import note_path
 from worklog import SearchResult, Store
 
 from tests.test_core_engine import fake_claude, success
@@ -71,6 +72,28 @@ def test_help_discloses_external_routing(command, capsys):
         cli.main([*command, "--help"])
     assert exit_info.value.code == 0
     assert "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다." in capsys.readouterr().out
+
+
+def test_hud_cli_prints_startup_and_closes_on_interrupt(tmp_path, monkeypatch, capsys):
+    from hud.server import HUDServer
+
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path / "data"))
+    started = []
+
+    def interrupt(server):
+        assert server.server_address == ("127.0.0.1", server.server_port)
+        assert server.server_port > 0
+        assert server.service.executors == cli.NOTE_EXECUTORS
+        started.append((server, server.nonce))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(HUDServer, "serve_forever", interrupt)
+    assert cli.main(["hud"]) == 0
+    [(server, nonce)] = started
+    assert server.nonce is None and server.socket.fileno() == -1
+    output = capsys.readouterr()
+    assert output.out.splitlines() == [server.origin, f"One-time code: {nonce}"]
+    assert output.err == ""
 
 
 def test_ask_stores_and_log_lists_answer(tmp_path, monkeypatch, capsys):
@@ -254,9 +277,9 @@ def test_pending_lists_only_actionable_approvals_and_expires_old_ones(approvals,
     assert capsys.readouterr().out.splitlines() == [
         f"{row.id}\t{row.kind}\t{summary}\t{datetime.fromisoformat(row.expires_at).astimezone():%Y-%m-%d %H:%M}"
         for row, summary in [
-            (note, f"{cli.note_path(note)}\tDraft preview"),
+            (note, f"{note_path(note)}\tDraft preview"),
             (imported, "archive (복사 예정 1건 · 12바이트)"),
-            (phone, f"{cli.note_path(phone)}\tphone draft"),
+            (phone, f"{note_path(phone)}\tphone draft"),
         ]
     ]
     assert store.get_approval(expired.id).status == "expired"

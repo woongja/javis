@@ -1,7 +1,6 @@
 """Command-line interface for the local javis gateway."""
 
 import argparse
-import json
 import os
 import sqlite3
 import sys
@@ -10,17 +9,17 @@ from pathlib import Path
 
 from brain import Unavailable, _display
 from brain.importer import build_manifest
-from brain.policy import Rejected, relative_parts
+from brain.policy import Rejected
 from channels.telegram.bot import TelegramBot, TelegramError
 from harness import HarnessError
 from harness.paths import env_value, repo_root
-from worklog import Approval, Store
+from worklog import Store
 
 from .approval import ApprovalService, is_interrupted, os_user as _os_user
 from .config import data_dir, load_settings
 from .engine import ClaudeEngine
 from .gateway import Request, handle
-from .note import NOTE_EXECUTORS, note_path
+from .note import NOTE_EXECUTORS, approval_summary, decide_on_pc, planned_copy
 from .recall import question_preview
 from .search import search_reply
 
@@ -82,18 +81,6 @@ def _approval_preview(text: str) -> str:
     return "".join(char if char.isprintable() else "?" for char in question_preview(text))
 
 
-def _approval_summary(approval: Approval) -> str:
-    if approval.kind == "note.create":
-        return f"{note_path(approval)}\t{_approval_preview(approval.payload or '')}"
-    try:
-        manifest = json.loads(approval.payload or "")
-        destination = "/".join(relative_parts(manifest["dest"]))
-        count, size = _planned_copy(manifest)
-    except (KeyError, TypeError, ValueError):
-        return "가져오기"
-    return f"{_display(destination)} (복사 예정 {count}건 · {size}바이트)"
-
-
 def _list_pending(store: Store, actor: str) -> int:
     pending = [
         row for row in store.list_approvals("pending") if row.can_decide(actor, "cli")
@@ -104,34 +91,25 @@ def _list_pending(store: Store, actor: str) -> int:
     ]
     for row in pending + interrupted:
         expires = datetime.fromisoformat(row.expires_at).astimezone()
-        line = f"{row.id}\t{row.kind}\t{_approval_summary(row)}\t{expires:%Y-%m-%d %H:%M}"
+        summary = approval_summary(row)
+        if row.kind == "note.create":
+            summary += f"\t{_approval_preview(row.payload or '')}"
+        line = f"{row.id}\t{row.kind}\t{summary}\t{expires:%Y-%m-%d %H:%M}"
         print(f"{line}\t{_UNKNOWN}" if row.status == "executing" else line)
     return 0
 
 
 def _decide(store: Store, id: str, actor: str, *, approve: bool) -> int:
     service = ApprovalService(store, NOTE_EXECUTORS)
-    if approve:
-        row = store.get_approval(id)
-        if row and row.status == "pending" and row.can_decide(actor, "cli"):
-            # The kind is fixed at creation; decide still checks the row atomically.
-            if row.kind not in service.executors:
-                return _approval_message(f"{row.kind}: 실행기 미등록")
-    decision = service.decide(id, actor, "cli", approve)
-    if decision.status != "claimed":
-        return _approval_message(_DECISION_MESSAGES[decision.status], ok=decision.status == "rejected")
-
-    claim = decision.approval
-    assert claim is not None
-    try:
-        result = service.execute(claim)
-        if service.finish(id, result.ok):
-            message = result.message or ("실행을 완료했습니다." if result.ok else "실행에 실패했습니다.")
-            return _approval_message(message, ok=result.ok)
-    except (Exception, KeyboardInterrupt):
-        # The executor may already have published its result.
-        pass
-    return _approval_message(f"{id}\t{_UNKNOWN}")
+    status, message = decide_on_pc(store, service, id, actor, approve=approve)
+    if status == "executor_missing":
+        return _approval_message(f"{message}: 실행기 미등록")
+    if status == "unknown":
+        return _approval_message(f"{id}\t{_UNKNOWN}")
+    if status in ("done", "failed"):
+        ok = status == "done"
+        return _approval_message(message or ("실행을 완료했습니다." if ok else "실행에 실패했습니다."), ok=ok)
+    return _approval_message(_DECISION_MESSAGES[status], ok=status == "rejected")
 
 
 def _resolve(store: Store, id: str, *, ok: bool) -> int:
@@ -145,11 +123,6 @@ def _resolve(store: Store, id: str, *, ok: bool) -> int:
     if not store.finish_approval(id, ok=ok, executor=(row.executor_pid, row.executor_started_at)):
         return _approval_message(_DECISION_MESSAGES["already_decided"])
     return _approval_message("완료로 마감했습니다." if ok else "실패로 마감했습니다.", ok=True)
-
-
-def _planned_copy(manifest: dict) -> tuple[int, int]:
-    copies = [file["size"] for file in manifest["files"] if file["status"] == "copy"]
-    return len(copies), sum(copies)
 
 
 def _brain_import_preview(manifest: dict, count: int) -> None:
@@ -180,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     search = commands.add_parser("search", help="Search saved web questions and answers")
     search.add_argument("terms", metavar="검색어", nargs="+")
     commands.add_parser("serve", help="Serve requests from Telegram")
+    commands.add_parser("hud", help="Serve the HUD on a local loopback port")
     commands.add_parser("pending", help="List actionable approvals and interrupted runs")
     commands.add_parser("approve", help="Approve and execute a pending request").add_argument("id", metavar="ID")
     commands.add_parser("reject", help="Reject a pending request").add_argument("id", metavar="ID")
@@ -204,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build_manifest(args.src, args.dest)
         except (Rejected, Unavailable) as error:
             return _approval_message(f"javis: {error}")
-        count, _ = _planned_copy(manifest)
+        count, _ = planned_copy(manifest)
         _brain_import_preview(manifest, count)
         if not count:
             return _approval_message("복사할 파일이 없어 승인을 제안하지 않았습니다.", ok=True)
@@ -235,6 +209,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         store = Store.open(directory)
+        if args.command == "hud":
+            from hud.server import HUDServer
+
+            try:
+                with HUDServer(store, _os_user(), ApprovalService(store, NOTE_EXECUTORS)) as server:
+                    server.run()
+            except KeyboardInterrupt:
+                pass
+            return 0
         if args.command == "brain":
             proposal = ApprovalService(store).propose("brain.import", manifest, _os_user(), "cli")
             return _approval_message(
