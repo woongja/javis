@@ -109,7 +109,26 @@ def bot(api, store, engine, **options):
 
 
 @pytest.mark.parametrize("text", ["/brain", "/brain private-query"])
-def test_brain_redirects_telegram_to_pc(api, store, text):
+def test_brain_redirects_telegram_to_pc(api, tmp_path, monkeypatch, text):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    data = tmp_path / "data"
+    store = Store.open(data)
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+    (vault / "VaultFilenameSentinel.md").write_text(
+        "# private-query VaultTitleSentinel\n\nprivate-query VaultBodySentinel", encoding="utf-8",
+    )
+    monkeypatch.setattr("brain._root", lambda: pytest.fail("Telegram opened the vault"))
+    queued = []
+    original_save = store.save
+
+    def save(record, *, chunks=None):
+        record_id = original_save(record, chunks=chunks)
+        queued.extend(store.pending_deliveries())
+        return record_id
+
+    monkeypatch.setattr(store, "save", save)
     engine = FakeEngine()
     api.updates(update(text=text))
     api.reply()
@@ -118,6 +137,10 @@ def test_brain_redirects_telegram_to_pc(api, store, text):
     [sent] = api.sent()
     assert 'PC에서 `javis ask "/brain …"`' in sent["text"]
     assert "private-query" not in sent["text"]
+    [(_, [queued_text], _)] = queued
+    assert queued_text.partition("\n\n")[0] == sent["text"].partition("\n\n")[0]
+    for marker in ("VaultFilenameSentinel", "VaultTitleSentinel", "VaultBodySentinel", "private-query"):
+        assert marker not in json.dumps(queued) and marker not in json.dumps(api.requests)
     record = store.by_update_key("40:101")
     assert record.request == "" and not record.items
     assert not engine.calls

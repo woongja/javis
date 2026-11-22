@@ -1,6 +1,7 @@
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -67,6 +68,39 @@ def test_ask_failure_is_logged_and_exits_nonzero(tmp_path, monkeypatch, capsys):
     [record] = Store.open(tmp_path).recent(10)
     assert record.status == "error" and record.reason == "configuration"
     assert f"기록 ID {record.id}" in capsys.readouterr().out
+
+
+def test_brain_query_title_and_body_stay_in_cli(tmp_path, monkeypatch, capsys):
+    data = tmp_path / "data"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    title = "VaultTitleSentinel"
+    body = "VaultBodySentinel"
+    query = "VaultQuerySentinel"
+    filename = "VaultFilenameSentinel.md"
+    (vault / filename).write_text(f"# {query} {title}\n\n{query} {body}", encoding="utf-8")
+    capture = tmp_path / "stdin.txt"
+    envelope = success([{"text": "control answer", "sources": []}])
+    shim = fake_claude(tmp_path, f"""
+with Path({str(capture)!r}).open("a", encoding="utf-8") as output:
+    print(question, file=output)
+print(json.dumps({envelope!r}))
+""")
+    engine_class = cli.ClaudeEngine
+    monkeypatch.setattr(cli, "ClaudeEngine", lambda settings: engine_class(settings, shim))
+
+    assert cli.main(["ask", f"/brain {query}"]) == 0
+    output = capsys.readouterr()
+    assert all(marker in output.out for marker in (title, body, query, filename))
+    assert str(vault) not in output.out and not output.err
+    assert cli.main(["ask", "/web control question"]) == 0
+    assert capture.read_text(encoding="utf-8").splitlines() == ["control question"]
+    with closing(sqlite3.connect(data / "javis.db")) as db:
+        dump = "\n".join(db.iterdump())
+    assert "control answer" in dump
+    assert all(marker not in dump for marker in (title, body, query, filename))
 
 
 def test_store_failure_emits_no_answer(tmp_path, monkeypatch, capsys):

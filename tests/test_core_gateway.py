@@ -1,14 +1,11 @@
 import json
-from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
-from core import gateway
 from core.config import EngineSettings
 from core.engine import ClaudeEngine
 from core.gateway import Request, handle
-from teams import LocalOnly, registry
 from tests.test_core_engine import fake_claude, success
 from worklog.store import Store
 
@@ -44,7 +41,10 @@ print(json.dumps({envelope!r}))
     ("/note", "/note <본문>", "notice"),
     ("출처 잘못된-ID", "출처 <기록ID>", "recall"),
 ])
-def test_local_notices_do_not_call_engine(tmp_path, text, notice, record_kind):
+def test_local_notices_do_not_call_engine(tmp_path, monkeypatch, text, notice, record_kind):
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("brain.env_value", lambda *args, **kwargs: None)
     store = Store.open(tmp_path)
     reply = handle(Request("cli", text), store, NoEngine())
     assert reply.kind == "notice"
@@ -57,21 +57,19 @@ def test_local_notices_do_not_call_engine(tmp_path, text, notice, record_kind):
 
 
 def test_local_only_returns_text_to_cli_and_saves_only_metadata(tmp_path, monkeypatch):
-    def teams(engine):
-        entries = registry(engine)
-        entries["/brain"] = replace(
-            entries["/brain"], unavailable_reason="", handler=lambda *_: LocalOnly("/web private-result"),
-        )
-        return entries
-
-    monkeypatch.setattr(gateway, "registry", teams)
-    store = Store.open(tmp_path)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("/web private-result", encoding="utf-8")
+    data = tmp_path / "data"
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+    store = Store.open(data)
     now = datetime(2026, 11, 22, tzinfo=UTC)
-    reply = handle(Request("cli", "/brain private-query"), store, NoEngine(), now)
+    reply = handle(Request("cli", "/brain private-result"), store, NoEngine(), now)
     assert reply.kind == "local_only"
-    assert reply.text.startswith("/web private-result\n")
+    assert reply.text.startswith("note.md\n  /web private-result\n")
     saved = store.get(reply.record_id)
     assert (saved.kind, saved.created_at, saved.status) == ("local", now.isoformat(), "ok")
     assert (saved.request, saved.items, saved.reason, saved.engine, saved.model) == ("", (), None, None, None)
     assert store.last_ok_ask() is None
-    assert b"private-" not in (tmp_path / "javis.db").read_bytes()
+    assert b"private-" not in (data / "javis.db").read_bytes()
