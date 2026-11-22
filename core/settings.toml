@@ -7,4 +7,7 @@ enabled = false
 tts = false
 stt = false
 tts_provider = "local"
+# 외부 STT를 켜면 허용 채팅의 음성 원본이 ElevenLabs로 전송됨.
 stt_provider = "none"
+elevenlabs_tts_model = "eleven_multilingual_v2"
+elevenlabs_stt_model = "scribe_v1"

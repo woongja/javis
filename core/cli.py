@@ -23,6 +23,7 @@ from .note import NOTE_EXECUTORS, approval_summary, decide_on_pc, planned_copy
 from .recall import question_preview
 from .search import search_reply
 from .voice import save_audio, voice_for
+from .voice_elevenlabs import credential_status
 
 
 def _count(value: str) -> int:
@@ -150,14 +151,22 @@ def _voice_status(directory: Path) -> int:
     print(f"enabled={str(settings.enabled).lower()}")
     code = 0
     for direction in ("tts", "stt"):
-        enabled = str(getattr(settings, direction)).lower()
+        enabled = getattr(settings, direction)
         provider = getattr(settings, f"{direction}_provider")
+        credentials = ""
         try:
-            availability = "yes" if voice_for(direction, settings) is not None else "no (disabled)"
+            if settings.enabled and enabled and provider == "elevenlabs":
+                presence, valid = credential_status(direction)
+                credentials = "".join(f" {name}={'present' if present else 'missing'}" for name, present in presence.items())
+                availability = "yes" if valid else "no (configuration error)"
+                if not valid:
+                    code = 1
+            else:
+                availability = "yes" if voice_for(direction, settings) is not None else "no (disabled)"
         except VoiceSettingsError as error:
             availability = f"no (configuration error: {error})"
             code = 1
-        print(f"{direction}={enabled} provider={provider!r} available={availability}")
+        print(f"{direction}={str(enabled).lower()} provider={provider!r} available={availability}{credentials}")
     return code
 
 

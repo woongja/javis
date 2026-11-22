@@ -21,6 +21,8 @@ class VoiceSettings:
     stt: bool = False
     tts_provider: str = "local"
     stt_provider: str = "none"
+    elevenlabs_tts_model: str = "eleven_multilingual_v2"
+    elevenlabs_stt_model: str = "scribe_v1"
 
 
 class VoiceSettingsError(ValueError):
@@ -35,7 +37,7 @@ def _voice_values(document: dict) -> dict:
         if key in ("enabled", "tts", "stt"):
             if type(value) is not bool:
                 raise VoiceSettingsError(f"voice.{key} must be a boolean")
-        elif key in ("tts_provider", "stt_provider"):
+        elif key in ("tts_provider", "stt_provider", "elevenlabs_tts_model", "elevenlabs_stt_model"):
             if not isinstance(value, str) or not value.strip():
                 raise VoiceSettingsError(f"voice.{key} must be a nonempty string")
         else:
@@ -48,8 +50,8 @@ def load_voice_settings(directory: Path) -> VoiceSettings:
         with files("core").joinpath("settings.toml").open("rb") as source:
             defaults = _voice_values(tomllib.load(source))
         try:
-            with (directory / "settings.toml").open("rb") as source:
-                overrides = _voice_values(tomllib.load(source))
+            contents = (directory / "settings.toml").read_bytes().decode("utf-8-sig")
+            overrides = _voice_values(tomllib.loads(contents))
         except FileNotFoundError:
             overrides = {}
     except (OSError, tomllib.TOMLDecodeError, UnicodeError):

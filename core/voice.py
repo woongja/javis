@@ -14,7 +14,7 @@ from .config import VoiceSettings, VoiceSettingsError, data_dir, load_voice_sett
 
 Direction = Literal["tts", "stt"]
 LOCAL_TIMEOUT_S = 30
-_EXTENSIONS = {"audio/wav": ".wav", "audio/aiff": ".aiff"}
+_EXTENSIONS = {"audio/wav": ".wav", "audio/aiff": ".aiff", "audio/mpeg": ".mp3"}
 _WINDOWS_SCRIPT = """
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
@@ -44,9 +44,14 @@ class STTProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class SettingsFactory[SpeechProvider]:
+    create: Callable[[VoiceSettings], SpeechProvider]
+
+
+@dataclass(frozen=True)
 class Provider:
-    tts: Callable[[], TTSProvider] | None = None
-    stt: Callable[[], STTProvider] | None = None
+    tts: Callable[[], TTSProvider] | SettingsFactory[TTSProvider] | None = None
+    stt: Callable[[], STTProvider] | SettingsFactory[STTProvider] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,7 +95,22 @@ def _local_tts() -> TTSProvider:
     return LocalTTS(platform, os.path.abspath(executable))
 
 
-PROVIDERS: dict[str, Provider] = {"local": Provider(tts=_local_tts)}
+def _elevenlabs_tts(settings: VoiceSettings) -> TTSProvider:
+    from .voice_elevenlabs import ElevenLabsTTS
+
+    return ElevenLabsTTS.create(settings.elevenlabs_tts_model)
+
+
+def _elevenlabs_stt(settings: VoiceSettings) -> STTProvider:
+    from .voice_elevenlabs import ElevenLabsSTT
+
+    return ElevenLabsSTT.create(settings.elevenlabs_stt_model)
+
+
+PROVIDERS: dict[str, Provider] = {
+    "local": Provider(tts=_local_tts),
+    "elevenlabs": Provider(tts=SettingsFactory(_elevenlabs_tts), stt=SettingsFactory(_elevenlabs_stt)),
+}
 
 
 @overload
@@ -111,6 +131,8 @@ def voice_for(direction: Direction, settings: VoiceSettings | None = None) -> TT
     factory = getattr(provider, direction, None)
     if factory is None:
         raise VoiceSettingsError(f"unsupported voice.{direction}_provider")
+    if isinstance(factory, SettingsFactory):
+        return factory.create(settings)
     return factory()
 
 

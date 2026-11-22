@@ -44,6 +44,8 @@ print(json.dumps({envelope!r}))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-test-value")
     monkeypatch.setenv("JAVIS_TELEGRAM_TOKEN", "fake-test-value")
     monkeypatch.setenv("TELEGRAM_TOKEN", "fake-test-value")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "fake-test-value")
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "fake-test-value")
     monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
     question = '질문 "&"\n다음 줄'
     result = ClaudeEngine(load_settings(), shim).run(question)
@@ -68,6 +70,7 @@ print(json.dumps({envelope!r}))
     assert "Do not prefix item text with numbers or list markers." in prompt
     assert "PATH" in recorded["env"]
     assert {"ANTHROPIC_API_KEY", "JAVIS_TELEGRAM_TOKEN", "TELEGRAM_TOKEN", "JAVIS_DATA_DIR"}.isdisjoint(recorded["env"])
+    assert not any(name.startswith("ELEVENLABS_") for name in recorded["env"])
 
 
 @pytest.mark.parametrize("body", [

@@ -145,10 +145,23 @@ def test_voice_settings_overrides_and_validation(tmp_path):
     assert load_voice_settings(tmp_path) == VoiceSettings()
     configure(tmp_path, 'enabled = true\ntts_provider = "test"')
     assert load_voice_settings(tmp_path) == VoiceSettings(enabled=True, tts_provider="test")
-    for values, message in [('tts = "true"', "must be a boolean"), ("extra = true", "unknown key")]:
+    for values, message in [
+        ('tts = "true"', "must be a boolean"), ("extra = true", "unknown key"),
+        ('elevenlabs_tts_model = " "', "must be a nonempty string"),
+    ]:
         configure(tmp_path, values)
         with pytest.raises(VoiceSettingsError, match=message):
             load_voice_settings(tmp_path)
+
+
+def test_voice_settings_accepts_utf8_bom_and_model_overrides(tmp_path):
+    (tmp_path / "settings.toml").write_text(
+        '[voice]\nenabled = true\nelevenlabs_tts_model = "custom_tts"\nelevenlabs_stt_model = "custom_stt"\n',
+        encoding="utf-8-sig",
+    )
+    assert load_voice_settings(tmp_path) == VoiceSettings(
+        enabled=True, elevenlabs_tts_model="custom_tts", elevenlabs_stt_model="custom_stt",
+    )
 
 
 def test_synthesis_failure_preserves_web_answer(tmp_path, cli_voice, monkeypatch, capsys):
