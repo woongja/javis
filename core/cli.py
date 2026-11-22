@@ -8,6 +8,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from brain import Unavailable, _display
+from brain.importer import build_manifest
+from brain.policy import Rejected
 from channels.telegram.bot import TelegramBot, TelegramError
 from harness import HarnessError
 from harness.paths import env_value, repo_root
@@ -143,6 +146,30 @@ def _resolve(store: Store, id: str, *, ok: bool) -> int:
     return _approval_message("완료로 마감했습니다." if ok else "실패로 마감했습니다.", ok=True)
 
 
+def _brain_import_preview(src: str, dest: str) -> int:
+    try:
+        manifest = build_manifest(src, dest)
+    except (Rejected, Unavailable) as error:
+        print(f"javis: {error}", file=sys.stderr)
+        return 1
+
+    files = manifest["files"]
+    totals = manifest["totals"]
+    conflicts = sum(file["status"] == "conflict" for file in files)
+    print(f"복사 예정 {totals['count'] - conflicts}건 · 충돌 {conflicts}건")
+    print(f"합계 {totals['count']}건 · {totals['bytes']}바이트")
+    limit = 10
+    for file in files[:limit]:
+        source = _display(file["src"])
+        target = _display(file["dest"])
+        status = "충돌로 건너뜀" if file["status"] == "conflict" else "복사 예정"
+        print(f"  {source} → {target} ({status})")
+    if len(files) > limit:
+        print(f"  외 {len(files) - limit}건")
+    print("승인 기능은 아직 없음(작업 10)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     external = "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다."
     parser = argparse.ArgumentParser(
@@ -160,9 +187,17 @@ def main(argv: list[str] | None = None) -> int:
     resolve = commands.add_parser("resolve", help="Record the verified outcome of an interrupted run")
     resolve.add_argument("id", metavar="ID")
     resolve.add_argument("outcome", choices=("done", "failed"))
+    brain = commands.add_parser("brain", help="Preview local vault operations")
+    brain_actions = brain.add_subparsers(dest="brain_action", required=True)
+    preview = brain_actions.add_parser("import", help="Preview the import of a Markdown directory")
+    preview.add_argument("src")
+    preview.add_argument("--dest", required=True, metavar="RELATIVE_PATH")
     args = parser.parse_args(argv)
     if args.command == "ask" and not args.text.strip():
         ask.error("text must not be empty")
+
+    if args.command == "brain" and args.brain_action == "import":
+        return _brain_import_preview(args.src, args.dest)
 
     if args.command == "serve":
         try:

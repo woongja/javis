@@ -182,11 +182,11 @@ def _checked_root(stack: ExitStack, vault: VaultRoot) -> _Directory:
     return root
 
 
-def _target_parent(
+def _target_directory(
     stack: ExitStack, root: _Directory, parts: tuple[str, ...], *, create: bool,
 ) -> _Directory:
     directory = root
-    for part in parts[:-1]:
+    for part in parts:
         directory = _directory(stack, directory.path / part, directory, inside=True, create=create)
     return directory
 
@@ -245,14 +245,14 @@ def publish(
         with ExitStack() as stack:
             root = _checked_root(stack, vault)
             check_write(parts, import_destination, _read_policy(root))
-            directory = _target_parent(stack, root, parts, create=True)
+            directory = _target_directory(stack, root, parts[:-1], create=True)
             if _target_exists(directory, name):
                 return PublishResult("conflict")
             with _completed_temp(directory, vault.path, content) as (temporary, info):
                 # Serialize case checks with publication for threads on case-sensitive filesystems.
                 with _publish_lock, ExitStack() as verify:
                     verified_root = _checked_root(verify, vault)
-                    parent = _target_parent(verify, verified_root, parts, create=False)
+                    parent = _target_directory(verify, verified_root, parts[:-1], create=False)
                     if not os.path.samestat(directory.info, parent.info):
                         raise Rejected("target directory changed")
                     if _target_exists(parent, name):

@@ -14,6 +14,57 @@ from worklog.store import Store
 from tests.test_core_engine import fake_claude, success
 
 
+def test_brain_import_preview_stays_local(tmp_path, monkeypatch, capsys):
+    source = tmp_path.resolve() / "source"
+    vault = source.with_name("vault")
+    data = source.with_name("data")
+    (source / "nested").mkdir(parents=True)
+    (vault / "imports/nested").mkdir(parents=True)
+    (source / "nested/old.md").write_bytes(b"original")
+    (vault / "imports/nested/OLD.md").write_bytes(b"")
+    for number in range(11):
+        (source / f"note-{number:02d}.md").write_bytes(b"private note")
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("preview opened the worklog or engine")
+
+    monkeypatch.setattr(cli.Store, "open", forbidden)
+    monkeypatch.setattr(cli, "ClaudeEngine", forbidden)
+    assert cli.main(["brain", "import", str(source), "--dest", "imports"]) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert "복사 예정 11건 · 충돌 1건" in output.out
+    assert "합계 12건 · 140바이트" in output.out
+    assert "nested/old.md → imports/nested/old.md (충돌로 건너뜀)" in output.out
+    assert "외 2건" in output.out
+    assert "승인 기능은 아직 없음(작업 10)" in output.out
+    assert str(source) not in output.out
+    assert str(vault) not in output.out
+    assert "private note" not in output.out
+    assert not data.exists()
+
+
+def test_brain_import_rejection_and_unconfigured_vault(tmp_path, monkeypatch, capsys):
+    import brain
+
+    source = tmp_path / "source"
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("JAVIS_BRAIN_DIR", raising=False)
+    monkeypatch.setattr(brain, "env_value", lambda *args, **kwargs: None)
+    assert cli.main(["brain", "import", str(source), "--dest", "imports"]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "JAVIS_BRAIN_DIR" in output.err
+    assert str(source) not in output.err
+    assert cli.main(["brain", "import", str(source), "--dest", str(tmp_path)]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "invalid relative path" in output.err
+    assert str(tmp_path) not in output.err
+
+
 @pytest.mark.parametrize("command", [[], ["ask"]])
 def test_help_discloses_external_routing(command, capsys):
     with pytest.raises(SystemExit) as exit_info:

@@ -39,6 +39,20 @@ def _descends_from(path: tuple[str, ...], directory: tuple[str, ...]) -> bool:
     return len(path) > len(directory) and path[:len(directory)] == directory
 
 
+def _allowed_directories(policy: str | None) -> list[tuple[str, ...]] | None:
+    if policy is None:
+        return None
+    try:
+        return [relative_parts(line) for line in policy.split("\n") if line]
+    except Rejected as error:
+        raise Rejected("invalid BRAIN.md policy") from error
+
+
+def _check_policy(path: tuple[str, ...], allowed: list[tuple[str, ...]] | None) -> None:
+    if allowed is not None and not any(_descends_from(path, directory) for directory in allowed):
+        raise Rejected("target is outside the BRAIN.md policy")
+
+
 def check_write(
     path: tuple[str, ...], import_destination: str | None, policy: str | None,
 ) -> None:
@@ -47,11 +61,4 @@ def check_write(
     base = _INBOX if import_destination is None else relative_parts(import_destination)
     if not _descends_from(path, base):
         raise Rejected("target is outside the approved directory")
-    if policy is None:
-        return
-    try:
-        allowed = [relative_parts(line) for line in policy.split("\n") if line]
-    except Rejected as error:
-        raise Rejected("invalid BRAIN.md policy") from error
-    if not any(_descends_from(path, directory) for directory in allowed):
-        raise Rejected("target is outside the BRAIN.md policy")
+    _check_policy(path, _allowed_directories(policy))

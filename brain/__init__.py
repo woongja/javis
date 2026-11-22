@@ -71,6 +71,14 @@ def _is_local(path: Path) -> bool:
     ) in (2, 3, 5, 6)  # removable, fixed, optical, RAM disk
 
 
+def _resolve_directory(path: Path) -> Path:
+    for component in (*reversed(path.parents), path):
+        info = component.lstat()
+        if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+            raise OSError("unsafe directory")
+    return path.resolve(strict=True)
+
+
 def _root() -> Path:
     try:
         checkout = _checkout()
@@ -88,10 +96,7 @@ def _root() -> Path:
         overlap_message = "두뇌 검색 폴더는 저장소 및 일지 폴더와 겹칠 수 없습니다."
         if any(_overlaps(configured, path) for path in protected):
             raise Unavailable(overlap_message)
-        for path in (configured, *configured.parents):
-            if _is_link(path.lstat()):
-                raise Unavailable(_INACCESSIBLE)
-        root = configured.resolve(strict=True)
+        root = _resolve_directory(configured)
         if any(_overlaps(root, path) for path in protected):
             raise Unavailable(overlap_message)
         if not root.is_dir():
