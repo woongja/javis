@@ -9,7 +9,7 @@ import pytest
 
 from core import approval, cli
 from core.approval import ApprovalService
-from worklog.store import Store
+from worklog import SearchResult, Store
 
 from tests.test_core_engine import fake_claude, success
 
@@ -119,6 +119,40 @@ def test_ask_failure_is_logged_and_exits_nonzero(tmp_path, monkeypatch, capsys):
     [record] = Store.open(tmp_path).recent(10)
     assert record.status == "error" and record.reason == "configuration"
     assert f"기록 ID {record.id}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("terms", [[], [" \t "]])
+def test_search_requires_terms(terms, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "data_dir", lambda: pytest.fail("search opened the data directory"))
+    with pytest.raises(SystemExit) as error:
+        cli.main(["search", *terms])
+    assert error.value.code == 2
+    assert "usage: javis search" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("status", "results", "code", "expected"), [
+    ("ok", [], 0, ["일치 없음"]),
+    ("degraded", [SearchResult(42, "2026-11-22", "회의 일정")], 0,
+     ["42\t2026-11-22\t회의 일정", "조사 붙은 단어 부분 일치 제한"]),
+    ("unavailable", [], 1, ["검색 사용 불가"]),
+])
+def test_search_statuses(status, results, code, expected, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "load_settings", lambda: pytest.fail("search loaded engine settings"))
+
+    def search(self, query):
+        assert query == "회의 일정"
+        return status, results
+
+    monkeypatch.setattr(Store, "search", search)
+    assert cli.main(["search", "회의", "일정"]) == code
+    output = capsys.readouterr()
+    if code == 0:
+        assert not output.err
+        assert output.out.splitlines() == [*expected, '출처는 `javis ask "출처 <ID>"`']
+    else:
+        assert not output.out
+        assert output.err.splitlines() == expected
 
 
 def test_brain_query_title_and_body_stay_in_cli(tmp_path, monkeypatch, capsys):

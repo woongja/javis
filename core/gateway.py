@@ -11,6 +11,7 @@ from worklog.store import Item, Record, Store
 from .approval import ApprovalService, note_proposal_reply, os_user
 from .engine import Engine
 from .recall import recall
+from .search import search_reply
 
 _NUMBER_PREFIX = re.compile(r"^(?:\*\*[0-9]{1,2}[.)]\*\*|(\*\*)?[0-9]{1,2}[.)])[ \t]+")
 _TITLE_LIMIT = 80
@@ -91,13 +92,21 @@ def _team_result(request: Request, teams: dict[str, Team]) -> TeamResult:
 def handle(request: Request, store: Store, engine: Engine, now: datetime | None = None) -> Reply:
     now = now or datetime.now(UTC)
     timestamp = now.astimezone(UTC).isoformat()
-    # Adapters handle their dedicated approval commands before calling this gateway.
-    recalled = None if request.text.lstrip().startswith("/") else recall(request.text, store, now)
     record = Record(
         id=None, created_at=timestamp, channel=request.channel, kind="notice",
         request="", items=(), status="error", reason=None, engine=None, model=None,
         duration_s=None, ref_id=None, update_key=request.processing_key,
     )
+    if request.channel == "telegram":
+        words = request.text.strip().split(maxsplit=2)
+        if words[:2] == ["기록", "검색"]:
+            query = words[2] if len(words) == 3 else ""
+            status, message = search_reply(store, query, "사용법: 기록 검색 <검색어>")
+            saved = replace(record, status="ok") if status in ("ok", "degraded") else record
+            return Reply(message, store.save(saved), "notice")
+
+    # Adapters handle their dedicated approval commands before calling this gateway.
+    recalled = None if request.text.lstrip().startswith("/") else recall(request.text, store, now)
     if recalled is not None:
         kind: ReplyKind = "notice"
         record = replace(

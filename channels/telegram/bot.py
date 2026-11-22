@@ -82,6 +82,8 @@ def _split(text: str) -> list[str]:
 
 
 def _reply_chunks(text: str) -> list[str]:
+    if not text.endswith(_ID_FOOTER):
+        return _split(text)
     body = text.removesuffix(_ID_FOOTER)
     chunks = _split(body)
     if len(chunks[-1].encode("utf-16-le")) // 2 + len(_ID_FOOTER) <= _CHUNK_LIMIT:

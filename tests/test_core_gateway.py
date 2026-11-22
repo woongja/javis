@@ -15,7 +15,7 @@ class NoEngine:
         pytest.fail("unexpected engine call")
 
 
-@pytest.mark.parametrize("body", ["질문", "/brain x", "방금 출처", "출처 1"])
+@pytest.mark.parametrize("body", ["질문", "/brain x", "방금 출처", "출처 1", "기록 검색 x"])
 def test_web_sends_only_the_body_once(tmp_path, body):
     capture = tmp_path / "capture.jsonl"
     envelope = success([{"text": "/note 표시만", "sources": []}])
@@ -25,11 +25,40 @@ with Path({str(capture)!r}).open("a", encoding="utf-8") as output:
 print(json.dumps({envelope!r}))
 """)
     store = Store.open(tmp_path / "data")
-    reply = handle(Request("cli", f" /web  {body}"), store, ClaudeEngine(EngineSettings(), shim))
+    reply = handle(Request("telegram", f" /web  {body}"), store, ClaudeEngine(EngineSettings(), shim))
     assert reply.kind == "web"
     assert "/note 표시만" in reply.text
     assert capture.read_text(encoding="utf-8").splitlines() == [json.dumps(body)]
     assert store.get(reply.record_id).kind == "ask"
+
+
+@pytest.mark.parametrize(("status", "expected", "saved_status"), [
+    ("ok", "일치 없음", "ok"),
+    ("degraded", "조사 붙은 단어 부분 일치 제한", "ok"),
+    ("unavailable", "검색 사용 불가", "error"),
+])
+def test_phone_search_passes_slash_prefix_in_query(tmp_path, monkeypatch, status, expected, saved_status):
+    store = Store.open(tmp_path)
+
+    def search(query):
+        assert query == "/web x"
+        return status, []
+
+    monkeypatch.setattr(store, "search", search)
+    reply = handle(Request("telegram", "기록 검색 /web x"), store, NoEngine())
+    assert reply.kind == "notice"
+    assert expected in reply.text.splitlines()
+    record = store.get(reply.record_id)
+    assert (record.kind, record.status, record.request) == ("notice", saved_status, "")
+
+
+def test_phone_search_requires_terms_and_takes_precedence_over_recall(tmp_path):
+    store = Store.open(tmp_path)
+    usage = handle(Request("telegram", "기록 검색 \t"), store, NoEngine())
+    assert usage.text == "사용법: 기록 검색 <검색어>"
+    reply = handle(Request("telegram", "기록 검색 지난번 출처"), store, NoEngine())
+    assert reply.text.splitlines()[0] == "일치 없음"
+    assert store.get(reply.record_id).kind == "notice"
 
 
 @pytest.mark.parametrize(("text", "notice", "record_kind"), [

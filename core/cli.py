@@ -22,6 +22,7 @@ from .engine import ClaudeEngine
 from .gateway import Request, handle
 from .note import NOTE_EXECUTORS, note_path
 from .recall import question_preview
+from .search import search_reply
 
 
 def _count(value: str) -> int:
@@ -176,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     ask.add_argument("text")
     log = commands.add_parser("log", help="Show recent worklog entries")
     log.add_argument("-n", metavar="N", type=_count, default=20)
+    search = commands.add_parser("search", help="Search saved web questions and answers")
+    search.add_argument("terms", metavar="검색어", nargs="+")
     commands.add_parser("serve", help="Serve requests from Telegram")
     commands.add_parser("pending", help="List actionable approvals and interrupted runs")
     commands.add_parser("approve", help="Approve and execute a pending request").add_argument("id", metavar="ID")
@@ -191,6 +194,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "ask" and not args.text.strip():
         ask.error("text must not be empty")
+    if args.command == "search":
+        query = " ".join(args.terms)
+        if not query.strip():
+            search.error("검색어를 입력해 주세요.")
 
     if args.command == "brain" and args.brain_action == "import":
         try:
@@ -248,6 +255,12 @@ def main(argv: list[str] | None = None) -> int:
                 local_time = datetime.fromisoformat(record.created_at).astimezone()
                 print(f"{record.id}\t{local_time:%Y-%m-%d %H:%M}\t{question_preview(record.request)}\t{record.status}")
             return 0
+        if args.command == "search":
+            status, message = search_reply(store, query, search.format_usage().strip())
+            if status == "usage":
+                search.error("검색어를 입력해 주세요.")
+            print(message, file=sys.stderr if status == "unavailable" else sys.stdout)
+            return 1 if status == "unavailable" else 0
         if args.command == "pending":
             return _list_pending(store, _os_user())
         if args.command in ("approve", "reject"):

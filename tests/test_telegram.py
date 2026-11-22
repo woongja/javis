@@ -108,6 +108,48 @@ def bot(api, store, engine, **options):
                        **({"sleep": unexpected_sleep} | options))
 
 
+def test_phone_search_and_recall_match_cli(api, store, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    cli_engine = FakeEngine()
+    monkeypatch.setattr(cli, "ClaudeEngine", lambda _settings: cli_engine)
+    questions = ["회의 일정", "회의 결정"]
+    for question in questions:
+        assert cli.main(["ask", question]) == 0
+    capsys.readouterr()
+
+    latest, first = store.recent(2)
+    assert cli.main(["search", "회의"]) == 0
+    cli_search = capsys.readouterr().out.rstrip("\n")
+    assert cli_search.splitlines() == [
+        f"{row.id}\t{row.created_at[:10]}\t{row.request}" for row in (latest, first)
+    ] + ['출처는 `javis ask "출처 <ID>"`']
+    assert cli_engine.calls == questions
+
+    engine = FakeEngine()
+    poller = bot(api, store, engine)
+    search = update(id=41, text="기록 검색 회의")
+    api.updates(update(id=40, text="기록 검색 회의", chat=CHAT + 1), search, search)
+    api.reply()
+    poller.poll_once()
+    assert [message["text"] for message in api.sent()] == [cli_search]
+
+    recall = f"출처 {latest.id}"
+    api.updates(update(id=42, text=recall), update(id=43, text="기록 검색 x"))
+    api.reply()
+    api.reply()
+    poller.poll_once()
+    assert cli.main(["ask", recall]) == 0
+    cli_recall = capsys.readouterr().out.rsplit("\n\n", 1)[0]
+    _, recalled, no_match = [message["text"] for message in api.sent()]
+    assert recalled.rsplit("\n\n", 1)[0] == cli_recall
+    assert cli_recall.splitlines()[0] == "1. 회의 결정"
+    assert store.by_update_key("42:101").ref_id == latest.id
+    assert no_match.splitlines()[0] == "일치 없음"
+    assert store.search("x")[1] == []
+    assert store.by_update_key("43:101").request == ""
+    assert engine.calls == [] and cli_engine.calls == questions
+
+
 @pytest.mark.parametrize("text", ["/brain", "/brain private-query"])
 def test_brain_redirects_telegram_to_pc(api, tmp_path, monkeypatch, text):
     vault = tmp_path / "vault"
