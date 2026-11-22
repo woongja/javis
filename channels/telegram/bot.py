@@ -15,6 +15,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request as HTTPReq
 from core.approval import ApprovalService, Executor
 from core.engine import Engine
 from core.gateway import Request, handle
+from core.note import NOTE_EXECUTORS
 from worklog.store import ApprovalKind, Record, Store
 
 _API_BASE = "https://api.telegram.org"
@@ -106,7 +107,7 @@ class TelegramBot:
         self._chat_id = chat_id
         self._store = store
         self._engine = engine
-        self._approvals = ApprovalService(store, executors)
+        self._approvals = ApprovalService(store, NOTE_EXECUTORS if executors is None else executors)
         self._api_base = api_base.rstrip("/")
         self._now = now
         self._sleep = sleep
@@ -230,16 +231,18 @@ class TelegramBot:
     def _approval_chunks(self, text: str) -> list[str]:
         return [_SAFE_ERROR] if self._token in text else _reply_chunks(text + _ID_FOOTER)
 
-    def _handle_approval(self, message: dict, words: list[str], key: str) -> None:
-        now = self._now()
+    def _direct_owner(self, message: dict) -> bool:
         sender = message.get("from")
-        authorized = (
+        return (
             isinstance(sender, dict) and type(sender.get("id")) is int
             and sender["id"] == self._chat_id and sender.get("is_bot") is False
             and not any(field.startswith("forward_") for field in message)
             and not message.get("is_automatic_forward")
         )
-        if not authorized:
+
+    def _handle_approval(self, message: dict, words: list[str], key: str) -> None:
+        now = self._now()
+        if not self._direct_owner(message):
             self._store.save_telegram_approval_reply(key, now, "forbidden", self._approval_chunks(
                 "승인 명령은 설정된 개인 채팅에서 소유자가 직접 보낸 메시지만 처리합니다.",
             ))
@@ -262,8 +265,12 @@ class TelegramBot:
             claim = result.approval
             if claim is not None:
                 try:
-                    ok = self._approvals.executors[claim.kind](claim)
-                    self._approvals.finish(claim.id, ok)
+                    outcome = self._approvals.execute(claim)
+                    if outcome.message is None:
+                        self._approvals.finish(claim.id, outcome.ok)
+                    else:
+                        chunks = _split(outcome.message) if self._token not in outcome.message else [_SAFE_ERROR]
+                        self._approvals.finish(claim.id, outcome.ok, chunks=chunks)
                 except Exception:
                     # The executor may have published its result. Keep the claim for local recovery.
                     pass
@@ -307,8 +314,18 @@ class TelegramBot:
             self._handle_approval(message, words, key)
             return
 
+        message_id = message.get("message_id")
+
+        def submit_note(body: str, now: datetime) -> None:
+            self._approvals.propose_telegram_note(body, str(self._chat_id), message_id, key, now, self._approval_chunks)
+
+        can_propose = self._direct_owner(message) and type(message_id) is int and 0 < message_id < 2**63
         staged = _DeferredSave(self._store)
-        reply = handle(Request("telegram", text, key), staged, self._engine, self._now())
+        request = Request("telegram", text, key, submit_note if can_propose else None)
+        reply = handle(request, staged, self._engine, self._now())
+        if reply.kind == "note":
+            self._resume_deliveries()
+            return
         record = staged.record
         if reply.kind == "local_only":
             self._store.save(record)

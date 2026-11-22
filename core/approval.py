@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,7 +26,19 @@ def _import_payload(payload: object) -> str:
 
 
 _PAYLOAD_VALIDATORS = {"note.create": _note_payload, "brain.import": _import_payload}
-Executor = Callable[[Approval], bool]
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    ok: bool
+    message: str | None = None
+
+
+Executor = Callable[[Approval], ExecutionResult | bool]
+
+
+def note_proposal_reply(id: str, expires_at: str) -> str:
+    return f"만료 {expires_at}\n승인 ID {id}\n승인하면 inbox에 새 노트 1개 생성"
 
 
 class ApprovalService:
@@ -71,16 +84,38 @@ class ApprovalService:
     ) -> Approval | None:
         """Save a phone note draft and queue a reply containing only approval metadata."""
         def delivery(id: str, expires_at: str) -> list[str]:
-            return reply_chunks(f"메시지 {message_id} · note.create · 1건\n만료 {expires_at}\n승인 ID {id}")
+            return reply_chunks(f"메시지 {message_id} · note.create · 1건\n{note_proposal_reply(id, expires_at)}")
 
         return self._store.create_telegram_note_proposal(
             owner=owner, message_id=message_id, update_key=update_key, now=now,
             payload=_note_payload(text), delivery=delivery,
         )
 
-    def finish(self, id: str, ok: bool) -> bool:
+    def execute(self, claim: Approval) -> ExecutionResult:
+        result = self.executors[claim.kind](claim)
+        return result if isinstance(result, ExecutionResult) else ExecutionResult(result)
+
+    def finish(self, id: str, ok: bool, *, chunks: list[str] | None = None) -> bool:
         """Finalize a claim made by the current process."""
-        return self._store.finish_approval(id, ok=ok, executor=_executor_identity())
+        return self._store.finish_approval(id, ok=ok, executor=_executor_identity(), chunks=chunks)
+
+
+def os_user() -> str:
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        get_username = ctypes.WinDLL("advapi32", use_last_error=True).GetUserNameW
+        get_username.argtypes = (wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+        get_username.restype = wintypes.BOOL
+        username = ctypes.create_unicode_buffer(257)  # UNLEN plus terminator
+        size = wintypes.DWORD(len(username))
+        if not get_username(username, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return username.value
+
+    import pwd
+
+    return pwd.getpwuid(os.geteuid()).pw_name
 
 
 def _executor_identity() -> tuple[int, str]:

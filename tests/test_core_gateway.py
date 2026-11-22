@@ -34,7 +34,7 @@ print(json.dumps({envelope!r}))
 
 @pytest.mark.parametrize(("text", "notice", "record_kind"), [
     ("/brain 로컬 검색어", "두뇌 검색", "notice"),
-    ("/note 비공개 초안", "메모 기능 준비 중", "notice"),
+    ("/note 비공개 초안", "JAVIS_BRAIN_DIR", "notice"),
     ("/unknown 질문", "사용법", "notice"),
     ("/web \t", "/web <질문>", "notice"),
     ("/brain", "/brain <검색어>", "notice"),

@@ -24,7 +24,7 @@ def test_registry_lists_research_and_unavailable_local_teams(monkeypatch):
         team = teams[prefix]
         available, reason = team.available()
         assert not available and reason
-        assert team.handler("private input", "cli") == Notice(reason)
+    assert teams["/brain"].handler("private input", "cli") == Notice(reason)
 
 
 def test_teams_and_brain_are_configured_as_wheel_packages():

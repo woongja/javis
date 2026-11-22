@@ -158,13 +158,18 @@ def test_pending_lists_only_actionable_approvals_and_expires_old_ones(approvals,
     manifest = {"dest": "archive", "files": ["one.md", "two.md"]}
     imported = service.propose("brain.import", manifest, actor, "cli", now)
     expired = service.propose("note.create", "expired", actor, "cli", now - timedelta(days=2))
-    service.propose("note.create", "other channel", actor, "telegram")
+    phone = service.propose("note.create", "phone draft", "chat", "telegram", now + timedelta(seconds=1))
+    service.propose("brain.import", manifest, actor, "telegram")
     service.propose("note.create", "other owner", "different-user", "cli")
 
     assert cli.main(["pending"]) == 0
     assert capsys.readouterr().out.splitlines() == [
         f"{row.id}\t{row.kind}\t{summary}\t{datetime.fromisoformat(row.expires_at).astimezone():%Y-%m-%d %H:%M}"
-        for row, summary in [(note, "Draft preview"), (imported, "archive (2개 파일)")]
+        for row, summary in [
+            (note, f"{cli.note_path(note)}\tDraft preview"),
+            (imported, "archive (2개 파일)"),
+            (phone, f"{cli.note_path(phone)}\tphone draft"),
+        ]
     ]
     assert store.get_approval(expired.id).status == "expired"
 
@@ -178,7 +183,7 @@ def test_approve_once_and_reject_without_execution(approvals, monkeypatch, capsy
         executed.append(claim.payload)
         return ok
 
-    monkeypatch.setattr(cli, "ApprovalService", lambda store: ApprovalService(store, {"note.create": publish}))
+    monkeypatch.setattr(cli, "NOTE_EXECUTORS", {"note.create": publish})
     approved = service.propose("note.create", "saved draft", actor, "cli")
     rejected = service.propose("note.create", "reject this", actor, "cli")
 
@@ -223,7 +228,7 @@ def test_interrupted_approval_is_resolved_without_reexecution(approvals, monkeyp
             patch.setattr(ApprovalService, "finish", interrupted)
         else:
             patch.setattr(ApprovalService, "decide", decide_then_interrupt)
-        patch.setattr(cli, "ApprovalService", lambda store: ApprovalService(store, {"note.create": publish}))
+        patch.setattr(cli, "NOTE_EXECUTORS", {"note.create": publish})
         if published:
             assert cli.main(["approve", proposed.id]) != 0
         else:
@@ -239,7 +244,7 @@ def test_interrupted_approval_is_resolved_without_reexecution(approvals, monkeyp
         raise ProcessLookupError(pid)
 
     monkeypatch.setattr(approval, "process_started_at", process_started_at)
-    monkeypatch.setattr(cli, "ApprovalService", lambda store: ApprovalService(store, {"note.create": publish}))
+    monkeypatch.setattr(cli, "NOTE_EXECUTORS", {"note.create": publish})
     assert cli.main(["approve", proposed.id]) != 0
     assert cli.main(["pending"]) == 0
     out = capsys.readouterr().out

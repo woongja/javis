@@ -1,12 +1,14 @@
 """Shared request, persistence and reply formatting for channel adapters."""
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
-from teams import LocalOnly, Notice, ReplyKind, Team, TeamResult, WebAnswer, registry
+from teams import LocalOnly, NoteDraft, Notice, ReplyKind, Team, TeamResult, WebAnswer, registry
 from worklog.store import Item, Record, Store
 
+from .approval import ApprovalService, note_proposal_reply, os_user
 from .engine import Engine
 from .recall import recall
 
@@ -26,12 +28,13 @@ class Request:
     channel: str
     text: str
     processing_key: str | None = None
+    submit_note: Callable[[str, datetime], None] | None = None
 
 
 @dataclass(frozen=True)
 class Reply:
     text: str
-    record_id: int
+    record_id: int | None
     kind: ReplyKind
 
 
@@ -71,7 +74,13 @@ def _team_result(request: Request, teams: dict[str, Team]) -> TeamResult:
             return Notice('PC에서 `javis ask "/brain …"`를 실행해 주세요.')
         if not arguments:
             return Notice(f"사용법: {team.usage}")
-        body = arguments[0]
+        if team.name == "note":
+            if request.channel != "cli" and request.submit_note is None:
+                return Notice("메모 제안은 설정된 개인 채팅에서 소유자가 직접 보낸 메시지만 처리합니다.")
+            # Remove one command separator and preserve the rest of the draft as entered.
+            body = body.lstrip()[len(prefix) + 1:]
+        else:
+            body = arguments[0]
 
     available, reason = team.available()
     if not available:
@@ -80,7 +89,8 @@ def _team_result(request: Request, teams: dict[str, Team]) -> TeamResult:
 
 
 def handle(request: Request, store: Store, engine: Engine, now: datetime | None = None) -> Reply:
-    timestamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+    now = now or datetime.now(UTC)
+    timestamp = now.astimezone(UTC).isoformat()
     # Adapters handle their dedicated approval commands before calling this gateway.
     recalled = None if request.text.lstrip().startswith("/") else recall(request.text, store, now)
     record = Record(
@@ -113,6 +123,15 @@ def handle(request: Request, store: Store, engine: Engine, now: datetime | None 
             kind = "local_only"
             record = replace(record, kind="local", status=answer.status)
             message = answer.text if request.channel == "cli" else ""
+        elif isinstance(answer, NoteDraft):
+            if request.submit_note is not None:
+                # Telegram persists the approval, record and reply in a single transaction.
+                request.submit_note(answer.text, now)
+                return Reply("", None, "note")
+            draft = ApprovalService(store).propose("note.create", answer.text, os_user(), "cli", now)
+            kind = "note"
+            record = replace(record, kind="approval", status="ok", reason="proposed")
+            message = note_proposal_reply(draft.id, draft.expires_at)
         else:
             kind = "notice"
             message = answer.text

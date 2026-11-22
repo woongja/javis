@@ -1,7 +1,6 @@
 """Command-line interface for the local javis gateway."""
 
 import argparse
-import ctypes
 import json
 import os
 import sqlite3
@@ -14,10 +13,11 @@ from harness import HarnessError
 from harness.paths import env_value, repo_root
 from worklog import Approval, Store
 
-from .approval import ApprovalService, is_interrupted
+from .approval import ApprovalService, is_interrupted, os_user as _os_user
 from .config import data_dir, load_settings
 from .engine import ClaudeEngine
 from .gateway import Request, handle
+from .note import NOTE_EXECUTORS, note_path
 from .recall import question_preview
 
 
@@ -59,24 +59,6 @@ def _telegram_settings() -> tuple[str, int] | None:
     return (token, chat_id) if token and chat_id is not None else None
 
 
-def _os_user() -> str:
-    if os.name == "nt":
-        from ctypes import wintypes
-
-        get_username = ctypes.WinDLL("advapi32", use_last_error=True).GetUserNameW
-        get_username.argtypes = (wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
-        get_username.restype = wintypes.BOOL
-        username = ctypes.create_unicode_buffer(257)  # UNLEN plus terminator
-        size = wintypes.DWORD(len(username))
-        if not get_username(username, ctypes.byref(size)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return username.value
-
-    import pwd
-
-    return pwd.getpwuid(os.geteuid()).pw_name
-
-
 _UNKNOWN = "결과 미상 — 확인 필요"
 _DECISION_MESSAGES = {
     "rejected": "거절했습니다.",
@@ -98,7 +80,7 @@ def _approval_preview(text: str) -> str:
 
 def _approval_summary(approval: Approval) -> str:
     if approval.kind == "note.create":
-        return _approval_preview(approval.payload or "")
+        return f"{note_path(approval)}\t{_approval_preview(approval.payload or '')}"
     try:
         manifest = json.loads(approval.payload or "")
     except ValueError:
@@ -113,7 +95,7 @@ def _approval_summary(approval: Approval) -> str:
 
 def _list_pending(store: Store, actor: str) -> int:
     pending = [
-        row for row in store.list_approvals("pending") if (row.owner, row.allowed_channel) == (actor, "cli")
+        row for row in store.list_approvals("pending") if row.can_decide(actor, "cli")
     ]
     interrupted = [row for row in store.list_approvals("executing") if is_interrupted(row)]
     for row in pending + interrupted:
@@ -124,10 +106,10 @@ def _list_pending(store: Store, actor: str) -> int:
 
 
 def _decide(store: Store, id: str, actor: str, *, approve: bool) -> int:
-    service = ApprovalService(store)
+    service = ApprovalService(store, NOTE_EXECUTORS)
     if approve:
         row = store.get_approval(id)
-        if row and (row.status, row.owner, row.allowed_channel) == ("pending", actor, "cli"):
+        if row and row.status == "pending" and row.can_decide(actor, "cli"):
             # The kind is fixed at creation; decide still checks the row atomically.
             if row.kind not in service.executors:
                 return _approval_message(f"{row.kind}: 실행기 미등록")
@@ -138,9 +120,10 @@ def _decide(store: Store, id: str, actor: str, *, approve: bool) -> int:
     claim = decision.approval
     assert claim is not None
     try:
-        ok = service.executors[claim.kind](claim)
-        if service.finish(id, ok):
-            return _approval_message("실행을 완료했습니다." if ok else "실행에 실패했습니다.", ok=ok)
+        result = service.execute(claim)
+        if service.finish(id, result.ok):
+            message = result.message or ("실행을 완료했습니다." if result.ok else "실행에 실패했습니다.")
+            return _approval_message(message, ok=result.ok)
     except (Exception, KeyboardInterrupt):
         # The executor may already have published its result.
         pass

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from core.engine import Engine, EngineResult
 
 
-ReplyKind = Literal["web", "local_only", "notice"]
+ReplyKind = Literal["web", "local_only", "notice", "note"]
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,12 @@ class Notice:
     text: str
 
 
-TeamResult = WebAnswer | LocalOnly | Notice
+@dataclass(frozen=True)
+class NoteDraft:
+    text: str
+
+
+TeamResult = WebAnswer | LocalOnly | Notice | NoteDraft
 
 
 @dataclass(frozen=True)
@@ -48,15 +53,18 @@ class Team:
         return not self.unavailable_reason, self.unavailable_reason
 
 
-_NOTE_UNAVAILABLE = "메모 기능 준비 중입니다."
-
-
 def _research(engine: "Engine", text: str, _channel: str) -> WebAnswer:
     return WebAnswer(engine.run(text))
 
 
-def _placeholder(reason: str, _text: str, _channel: str) -> Notice:
-    return Notice(reason)
+def _note(text: str, _channel: str) -> NoteDraft | Notice:
+    if not text.strip():
+        return Notice("사용법: /note <본문>")
+    try:
+        text.encode("utf-8")
+    except UnicodeError:
+        return Notice("메모 본문은 UTF-8로 저장할 수 있어야 합니다.")
+    return NoteDraft(text)
 
 
 def _brain_search(text: str, channel: str) -> LocalOnly | Notice:
@@ -86,6 +94,6 @@ def registry(engine: "Engine") -> dict[str, Team]:
         ),
         "/note": Team(
             "note", "메모 제안", "/note <본문>",
-            partial(_placeholder, _NOTE_UNAVAILABLE), _NOTE_UNAVAILABLE,
+            _note, availability=brain.available,
         ),
     }

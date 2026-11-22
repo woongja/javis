@@ -60,6 +60,12 @@ class Approval:
     executor_started_at: str | None
     decision_update_key: str | None
 
+    def can_decide(self, actor: str, channel: str) -> bool:
+        # The local CLI and the configured Telegram chat belong to the same private store.
+        if channel == "cli" and self.allowed_channel == "telegram" and self.kind == "note.create":
+            return True
+        return (self.owner, self.allowed_channel) == (actor, channel)
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -485,7 +491,8 @@ class Store:
             return Decision("not_found")
         if channel == "telegram" and row["kind"] == "brain.import":
             return Decision("pc_only")
-        if row["owner"] != actor or row["allowed_channel"] != channel:
+        approval = Approval(**dict(row))
+        if not approval.can_decide(actor, channel):
             return Decision("forbidden")
         if row["status"] == "expired":
             return Decision("expired")
@@ -524,7 +531,7 @@ class Store:
             """,
             (
                 "executing" if approve else "rejected", pid, started_at, update_key,
-                approve, approve, id, actor, channel, digest, timestamp,
+                approve, approve, id, approval.owner, approval.allowed_channel, digest, timestamp,
             ),
         )
         rows = updated.fetchall()
@@ -532,17 +539,38 @@ class Store:
             raise sqlite3.DatabaseError("approval decision did not update one row")
         return Decision("claimed", Approval(**dict(rows[0]))) if approve else Decision("rejected")
 
-    def finish_approval(self, id: str, *, ok: bool, executor: tuple[int, str]) -> bool:
+    def finish_approval(
+        self, id: str, *, ok: bool, executor: tuple[int, str], chunks: list[str] | None = None,
+    ) -> bool:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            updated = db.execute(
+            status = "done" if ok else "failed"
+            row = db.execute(
                 """
                 UPDATE approvals SET status = ?, payload = NULL, payload_hash = NULL
                 WHERE id = ? AND status = 'executing' AND executor_pid = ? AND executor_started_at = ?
+                RETURNING decision_update_key
                 """,
-                ("done" if ok else "failed", id, *executor),
-            )
-            return updated.rowcount == 1
+                (status, id, *executor),
+            ).fetchone()
+            if row is None:
+                return False
+            if chunks is not None:
+                record = db.execute(
+                    "UPDATE records SET status = ?, reason = ? WHERE update_key = ? RETURNING id",
+                    ("ok" if ok else "error", status, row["decision_update_key"]),
+                ).fetchone()
+                if record is None:
+                    raise sqlite3.DatabaseError("approval decision reply is missing")
+                # Replace the committed acknowledgement before the poller drains the queue.
+                db.execute(
+                    """
+                    UPDATE deliveries SET chunks = ?, chunk_count = ?
+                    WHERE record_id = ? AND next_index = 0 AND failure_reason IS NULL
+                    """,
+                    (json.dumps(chunks), len(chunks), record["id"]),
+                )
+            return True
 
     def get(self, id: int) -> Record | None:
         with self._connect() as db:

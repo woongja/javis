@@ -64,6 +64,7 @@ def test_telegram_note_proposal_rolls_back_and_replays_saved_delivery(tmp_path, 
     assert (row.kind, row.reason, row.request, row.items) == ("approval", "proposed", "", ())
     assert store.pending_deliveries() == [(row.id, [
         "메시지 37 · note.create · 1건", f"만료 {proposal.expires_at}", f"승인 ID {proposal.id}",
+        "승인하면 inbox에 새 노트 1개 생성",
     ], 0)]
     store.mark_sent(row.id, 1)
     reopened = Store.open(tmp_path)

@@ -10,7 +10,7 @@ from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
-from . import _is_link
+from . import _is_link, _root
 from .policy import Rejected, check_write, relative_parts
 
 _WINDOWS = os.name == "nt"
@@ -111,6 +111,10 @@ def pin_root(path: Path) -> VaultRoot:
     with ExitStack() as stack:
         directory = _open_root(stack, path)
         return VaultRoot(path, *_identity(directory.info))
+
+
+def pin_configured_root() -> VaultRoot:
+    return pin_root(_root())
 
 
 def _verify_file(

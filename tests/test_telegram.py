@@ -150,13 +150,13 @@ def test_local_only_result_creates_no_telegram_delivery(api, store, monkeypatch)
     def teams(engine):
         entries = registry(engine)
         entries["/note"] = replace(
-            entries["/note"], unavailable_reason="", handler=lambda *_: LocalOnly("private-result"),
+            entries["/note"], availability=None, handler=lambda *_: LocalOnly("private-result"),
         )
         return entries
 
     monkeypatch.setattr(gateway, "registry", teams)
     engine = FakeEngine()
-    message = update(text="/note private-query")
+    message = owner_update(40, "/note private-query", message_id=81)
     api.updates(message, message)
     bot(api, store, engine).poll_once()
 
