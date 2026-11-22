@@ -1,4 +1,7 @@
+import hashlib
+import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from contextlib import closing
@@ -202,3 +205,85 @@ def test_delivery_save_and_permanent_failure_are_atomic(tmp_path):
         assert db.execute(
             "SELECT failure_reason FROM deliveries WHERE record_id = ?", (record_id,)
         ).fetchone() == ("forbidden",)
+
+
+@pytest.fixture
+def approval_fields():
+    return {
+        "kind": "note.create",
+        "owner": "example-owner",
+        "allowed_channel": "cli",
+        "created_at": "2026-11-22T12:00:00Z",
+        "expires_at": "2026-11-23T12:00:00Z",
+        "payload": "Private draft 초안",
+    }
+
+
+def test_approval_round_trip_is_private(tmp_path, approval_fields):
+    store = Store.open(tmp_path)
+    first = store.create_approval(**approval_fields)
+    second = store.create_approval(**(approval_fields | {
+        "kind": "brain.import",
+        "created_at": "2026-11-22T13:00:00+00:00",
+    }))
+    assert first.id != second.id
+    assert len(bytes.fromhex(first.id)) == len(bytes.fromhex(second.id)) == 16
+    assert first.kind == approval_fields["kind"]
+    assert first.owner == approval_fields["owner"]
+    assert first.allowed_channel == approval_fields["allowed_channel"]
+    assert first.created_at == "2026-11-22T12:00:00.000000+00:00"
+    assert first.expires_at == "2026-11-23T12:00:00.000000+00:00"
+    assert first.status == "pending"
+    assert first.payload == approval_fields["payload"]
+    assert first.payload_hash == hashlib.sha256(approval_fields["payload"].encode()).hexdigest()
+    assert first.executor_pid is first.executor_started_at is first.decision_update_key is None
+
+    reopened = Store.open(tmp_path)
+    assert reopened.get_approval(first.id) == first
+    assert reopened.get_approval("missing") is None
+    assert reopened.list_approvals("pending") == [first, second]
+    assert reopened.list_approvals("done") == []
+    assert reopened.recent(10) == []
+    assert reopened.pending_deliveries() == []
+
+
+def test_approval_constraints(tmp_path, approval_fields):
+    store = Store.open(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        store.create_approval(**(approval_fields | {"kind": "ask"}))
+    approval = store.create_approval(**approval_fields)
+    with closing(sqlite3.connect(tmp_path / "javis.db")) as db, db:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            db.execute("UPDATE approvals SET status = 'unknown' WHERE id = ?", (approval.id,))
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute("UPDATE approvals SET payload = 'changed' WHERE id = ?", (approval.id,))
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute("UPDATE approvals SET payload_hash = 'changed' WHERE id = ?", (approval.id,))
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            db.execute(
+                "UPDATE approvals SET payload = NULL, payload_hash = NULL WHERE id = ?",
+                (approval.id,),
+            )
+    assert store.get_approval(approval.id) == approval
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem modes")
+def test_private_database_permissions(tmp_path):
+    data_dir = tmp_path / "private"
+    db_path = data_dir / "javis.db"
+
+    Store.open(data_dir)
+    assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+    data_dir.chmod(0o755)
+    db_path.chmod(0o644)
+    with closing(sqlite3.connect(db_path)) as db:
+        db.execute("SELECT * FROM schema_version").fetchall()
+        sidecars = [data_dir / "javis.db-wal", data_dir / "javis.db-shm"]
+        for path in sidecars:
+            path.chmod(0o644)
+        Store.open(data_dir)
+        assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+        for path in [db_path, *sidecars]:
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600

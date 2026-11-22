@@ -1,5 +1,5 @@
 """Persistent worklog for the local Javis gateway."""
 
-from .store import Item, Record, Store
+from .store import Approval, ApprovalKind, ApprovalStatus, Item, Record, Store
 
-__all__ = ["Item", "Record", "Store"]
+__all__ = ["Approval", "ApprovalKind", "ApprovalStatus", "Item", "Record", "Store"]

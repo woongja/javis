@@ -1,11 +1,14 @@
-"""SQLite storage for request history and Telegram delivery recovery."""
+"""SQLite storage for request history, Telegram deliveries, and approvals."""
 
+import hashlib
 import json
+import os
+import secrets
 import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal
@@ -34,9 +37,28 @@ class Record:
     update_key: str | None
 
 
+ApprovalKind = Literal["note.create", "brain.import"]
+ApprovalStatus = Literal["pending", "executing", "done", "failed", "rejected", "expired"]
+
+
+@dataclass(frozen=True)
+class Approval:
+    id: str
+    kind: ApprovalKind
+    owner: str
+    allowed_channel: str
+    created_at: str
+    expires_at: str
+    status: ApprovalStatus
+    payload: str | None = field(repr=False)
+    payload_hash: str | None
+    executor_pid: int | None
+    executor_started_at: str | None
+    decision_update_key: str | None
+
+
 _BUSY_TIMEOUT = 5.0
-_SCHEMA_VERSION = 1
-_SCHEMA = (
+_SCHEMA_V1 = (
     """
     CREATE TABLE records (
         id INTEGER PRIMARY KEY,
@@ -78,6 +100,60 @@ _SCHEMA = (
     """,
 )
 
+_MIGRATE_V1_TO_V2 = (
+    """
+    CREATE TABLE approvals (
+        id TEXT PRIMARY KEY NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('note.create', 'brain.import')),
+        owner TEXT NOT NULL,
+        allowed_channel TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'executing', 'done', 'failed', 'rejected', 'expired')),
+        payload TEXT,
+        payload_hash TEXT,
+        executor_pid INTEGER,
+        executor_started_at TEXT,
+        decision_update_key TEXT,
+        CHECK (
+            (payload IS NOT NULL AND payload_hash IS NOT NULL)
+            OR (payload IS NULL AND payload_hash IS NULL AND status NOT IN ('pending', 'executing'))
+        )
+    )
+    """,
+    "CREATE INDEX approvals_status_created ON approvals (status, created_at, id)",
+    """
+    CREATE TRIGGER approvals_immutable_payload
+    BEFORE UPDATE OF payload, payload_hash ON approvals
+    WHEN (NEW.payload IS NOT OLD.payload OR NEW.payload_hash IS NOT OLD.payload_hash)
+        AND (NEW.payload IS NOT NULL OR NEW.payload_hash IS NOT NULL)
+    BEGIN
+        SELECT RAISE(ABORT, 'approval payload and hash are immutable');
+    END
+    """,
+)
+
+_MIGRATIONS = (_SCHEMA_V1, _MIGRATE_V1_TO_V2)
+_SCHEMA_VERSION = len(_MIGRATIONS)
+
+
+def _utc_timestamp(value: str, name: str) -> datetime:
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.utcoffset() != timedelta(0):
+        raise ValueError(f"{name} must be a UTC ISO 8601 timestamp")
+    return timestamp
+
+
+def _restrict_database_permissions(path: Path) -> None:
+    path.chmod(0o600)
+    for suffix in ("-wal", "-shm"):
+        try:
+            path.with_name(path.name + suffix).chmod(0o600)
+        except FileNotFoundError:
+            # SQLite may remove these files when the last connection closes.
+            pass
+
 
 def _read_record(row: sqlite3.Row) -> Record:
     fields = dict(row)
@@ -96,9 +172,15 @@ class Store:
 
     @classmethod
     def open(cls, data_dir: Path) -> "Store":
-        data_dir.mkdir(parents=True, exist_ok=True)
+        # Windows keeps its existing filesystem permissions.
+        data_dir.mkdir(mode=0o700 if os.name == "posix" else 0o777, parents=True, exist_ok=True)
         store = cls(data_dir.resolve() / "javis.db")
+        if os.name == "posix":
+            store._path.parent.chmod(0o700)
         with store._connect() as db:
+            if os.name == "posix":
+                # SQLite creates the DB inside the private directory before WAL starts.
+                _restrict_database_permissions(store._path)
             deadline = time.monotonic() + _BUSY_TIMEOUT
             while True:
                 try:
@@ -115,12 +197,15 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             db.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
             row = db.execute("SELECT version FROM schema_version").fetchone()
-            if row is None:
-                for statement in _SCHEMA:
-                    db.execute(statement)
-                db.execute("INSERT INTO schema_version VALUES (?)", (_SCHEMA_VERSION,))
-            elif row["version"] != _SCHEMA_VERSION:
+            version = row["version"] if row is not None else 0
+            if row is not None and not 1 <= version <= _SCHEMA_VERSION:
                 raise sqlite3.DatabaseError("unsupported worklog schema version")
+            if row is None:
+                db.execute("INSERT INTO schema_version VALUES (0)")
+            for next_version in range(version + 1, _SCHEMA_VERSION + 1):
+                for statement in _MIGRATIONS[next_version - 1]:
+                    db.execute(statement)
+                db.execute("UPDATE schema_version SET version = ?", (next_version,))
         return store
 
     @contextmanager
@@ -132,9 +217,7 @@ class Store:
 
     def save(self, record: Record, *, chunks: list[str] | None = None) -> int:
         """Save a record and any initial delivery together. The DB assigns the ID."""
-        created_at = datetime.fromisoformat(record.created_at)
-        if created_at.utcoffset() != timedelta(0):
-            raise ValueError("created_at must be a UTC ISO 8601 timestamp")
+        created_at = _utc_timestamp(record.created_at, "created_at")
         created_utc = created_at.astimezone(UTC).isoformat(timespec="microseconds")
         items = json.dumps([(item.text, item.sources) for item in record.items])
         with self._connect() as db:
@@ -162,6 +245,51 @@ class Store:
             if chunks is not None:
                 self._set_delivery(db, record_id, chunks)
             return record_id
+
+    def create_approval(
+        self,
+        *,
+        kind: ApprovalKind,
+        owner: str,
+        allowed_channel: str,
+        created_at: str,
+        expires_at: str,
+        payload: str,
+    ) -> Approval:
+        """Store a pending approval and hash the exact UTF-8 execution payload."""
+        created = _utc_timestamp(created_at, "created_at")
+        expires = _utc_timestamp(expires_at, "expires_at")
+        if expires <= created:
+            raise ValueError("expires_at must be after created_at")
+        with self._connect() as db:
+            row = db.execute(
+                """
+                INSERT INTO approvals (
+                    id, kind, owner, allowed_channel, created_at, expires_at, payload, payload_hash
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
+                """,
+                (
+                    secrets.token_hex(16), kind, owner, allowed_channel,
+                    created.isoformat(timespec="microseconds"),
+                    expires.isoformat(timespec="microseconds"),
+                    payload, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                ),
+            ).fetchone()
+        return Approval(**dict(row))
+
+    def get_approval(self, id: str) -> Approval | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM approvals WHERE id = ?", (id,)).fetchone()
+        return Approval(**dict(row)) if row is not None else None
+
+    def list_approvals(self, status: ApprovalStatus) -> list[Approval]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM approvals WHERE status = ? ORDER BY created_at, id", (status,)
+            ).fetchall()
+        return [Approval(**dict(row)) for row in rows]
 
     def get(self, id: int) -> Record | None:
         with self._connect() as db:
