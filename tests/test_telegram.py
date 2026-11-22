@@ -60,14 +60,16 @@ def api():
             pass
 
         def do_GET(self):
-            fake.requests.append(("GET", self.path))
-            self.send_error(405)
+            self.respond("GET", self.path)
 
         def do_POST(self):
             method = self.path.removeprefix(f"/bot{TOKEN}/")
             content_type = self.headers["Content-Type"]
             data = self.rfile.read(int(self.headers["Content-Length"]))
             payload = json.loads(data) if content_type == "application/json" else (content_type, data)
+            self.respond(method, payload)
+
+        def respond(self, method, payload):
             fake.requests.append((method, payload))
             if not fake.expected or fake.expected[0][0] != method:
                 self.send_response(409)
@@ -81,7 +83,12 @@ def api():
             for name, value in headers.items():
                 self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(json.dumps({"ok": True, "result": {}} if body is None else body).encode())
+            if callable(body):
+                body = body()
+            data = body if isinstance(body, bytes) else json.dumps(
+                {"ok": True, "result": {}} if body is None else body,
+            ).encode()
+            self.wfile.write(data)
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         fake.url = f"http://127.0.0.1:{server.server_port}"

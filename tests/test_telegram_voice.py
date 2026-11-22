@@ -1,19 +1,24 @@
 from dataclasses import replace
+from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
+from threading import Event
 
 import pytest
 
 from channels.telegram import bot as telegram
 from core import gateway, voice
+from core.approval import ApprovalService
 from core.engine import EngineResult
 from core.voice import Audio, Provider
+from core.voice_elevenlabs import ElevenLabsConfigError, ElevenLabsError
 from teams import LocalOnly, Team, registry
 from tests.test_telegram import CHAT, TOKEN, FakeEngine, api, bot, owner_update, store, update
 from worklog.store import Item, Store
 
 ANSWER = "synthetic answer body"
 AUDIO = b"\x00synthetic audio bytes\xff"
+FILE_PATH = "voice/synthetic_file.ogg"
 
 
 @pytest.fixture
@@ -221,3 +226,216 @@ def test_partial_restart_and_permanent_text_failure_skip_speech(api, store, enab
     assert enabled.created == 0 and enabled.calls == []
     assert reopened.pending_deliveries() == []
     assert reopened.get_offset()[0] == 42
+
+
+@pytest.fixture
+def transcription(monkeypatch):
+    class Transcription:
+        draft = "synthetic transcript"
+        error = None
+
+        def __init__(self):
+            self.created = 0
+            self.calls = []
+
+        def create(self):
+            self.created += 1
+            return self
+
+        def transcribe(self, audio):
+            self.calls.append(audio)
+            if self.error is not None:
+                raise self.error
+            return self.draft
+
+    fake = Transcription()
+    monkeypatch.setitem(voice.PROVIDERS, "elevenlabs", Provider(stt=fake.create))
+    return fake
+
+
+def set_stt(tmp_path, switches):
+    (tmp_path / "settings.toml").write_text(
+        '[voice]\nstt_provider = "elevenlabs"\n' + switches, encoding="utf-8",
+    )
+
+
+def audio_update(id=40, *, field="voice", metadata=None, **kwargs):
+    attachment = {"file_id": "synthetic-id", "file_size": len(AUDIO), "duration": 120, "mime_type": "audio/ogg"}
+    attachment.update(metadata or {})
+    return owner_update(id, None, message_id=id, **{field: attachment}, **kwargs)
+
+
+def file_info(api, path=FILE_PATH):
+    api.add("getFile", body={"ok": True, "result": {"file_path": path}})
+
+
+@pytest.mark.parametrize("switches", [None, "enabled = true\n", "stt = true\n"])
+def test_stt_off(api, store, transcription, tmp_path, switches):
+    if switches is not None:
+        set_stt(tmp_path, switches)
+    api.updates(audio_update())
+    api.reply()
+    bot(api, store, FakeEngine()).poll_once()
+    assert methods(api) == ["getUpdates", "sendMessage"]
+    assert "음성 입력이 꺼져" in api.sent()[0]["text"]
+    assert transcription.created == 0 and transcription.calls == []
+
+
+def test_stt_checks_chat_sender_and_metadata(api, store, transcription, tmp_path):
+    set_stt(tmp_path, "enabled = true\nstt = true\n")
+    api.updates(
+        audio_update(40, chat=CHAT + 1),
+        audio_update(41, kind="group"),
+        audio_update(42, sender=CHAT + 1),
+        audio_update(43, metadata={"file_size": 10 * 1024 * 1024 + 1}),
+        audio_update(44, metadata={"duration": 121}),
+        audio_update(45, metadata={"mime_type": "text/plain"}),
+        audio_update(46, metadata={"file_size": None}),
+    )
+    for _ in range(5):
+        api.reply()
+    bot(api, store, FakeEngine()).poll_once()
+    assert methods(api) == ["getUpdates"] + ["sendMessage"] * 5
+    assert "소유자" in api.sent()[0]["text"]
+    assert all("허용 범위" in reply["text"] for reply in api.sent()[1:])
+    assert transcription.created == 0 and transcription.calls == []
+
+
+@pytest.mark.parametrize("case", ["oversized", "oversized_header", "redirect", "foreign", "traversal"])
+def test_stt_refuses_unsafe_downloads(api, store, transcription, tmp_path, caplog, case):
+    set_stt(tmp_path, "enabled = true\nstt = true\n")
+    api.updates(audio_update())
+    if case == "foreign":
+        file_info(api, f"https://example.invalid/{TOKEN}/{FILE_PATH}")
+    elif case == "traversal":
+        file_info(api, "voice/../" + FILE_PATH)
+    else:
+        file_info(api)
+        if case == "redirect":
+            api.add("GET", 302, headers={"Location": api.url + "/redirect-target"})
+        else:
+            headers = {"Content-Length": str(len(AUDIO) + 1)} if case == "oversized_header" else None
+            api.add("GET", body=AUDIO + b"!", headers=headers)
+    api.reply()
+    bot(api, store, FakeEngine()).poll_once()
+    downloads = [(method, path) for method, path in api.requests if method == "GET"]
+    assert downloads == ([] if case in {"foreign", "traversal"} else [("GET", f"/file/bot{TOKEN}/{FILE_PATH}")])
+    assert "다운로드하지 못했습니다" in api.sent()[0]["text"]
+    assert transcription.calls == []
+    output = caplog.text + api.sent()[0]["text"] + dump(store)
+    assert TOKEN not in output and FILE_PATH not in output
+
+
+def test_stt_download_deadline(api, store, transcription, tmp_path, monkeypatch):
+    set_stt(tmp_path, "enabled = true\nstt = true\n")
+    finish = Event()
+
+    def stalled_body():
+        finish.wait(timeout=5)
+        return b""
+
+    monkeypatch.setattr(telegram, "_VOICE_DOWNLOAD_TIMEOUT", 1)
+    api.updates(audio_update())
+    file_info(api)
+    api.add("GET", body=stalled_body, headers={"Content-Length": str(len(AUDIO))})
+    api.reply()
+    try:
+        bot(api, store, FakeEngine()).poll_once()
+    finally:
+        finish.set()
+    assert methods(api) == ["getUpdates", "getFile", "GET", "sendMessage"]
+    assert "시간이 초과" in api.sent()[0]["text"]
+    assert transcription.calls == []
+
+
+@pytest.mark.parametrize("draft", ["synthetic transcript", "승인 {id}", "/note x", "기록 검색 y", "/web z", "😀" * 4100])
+def test_stt_sends_only_a_draft(api, store, enabled, transcription, tmp_path, monkeypatch, draft):
+    set_stt(tmp_path, "enabled = true\nstt = true\ntts = true\n")
+    proposal = ApprovalService(store).propose("note.create", "draft", str(CHAT), "telegram", datetime.now(UTC))
+    transcription.draft = draft.format(id=proposal.id)
+    before_files = set(tmp_path.rglob("*"))
+    engine = FakeEngine()
+    monkeypatch.setattr(telegram, "handle", lambda *args: pytest.fail("gateway called"))
+    monkeypatch.setattr(ApprovalService, "decide", lambda *args: pytest.fail("approval decision called"))
+    monkeypatch.setattr(store, "search", lambda *args: pytest.fail("search called"))
+    item = audio_update(field="audio", metadata={"mime_type": "audio/mp4"})
+    api.updates(item, item)
+    file_info(api)
+    api.add("GET", body=AUDIO, headers={"Content-Length": str(len(AUDIO))})
+    api.reply()
+    bot(api, store, engine).poll_once()
+
+    assert methods(api) == ["getUpdates", "getFile", "GET", "sendMessage"]
+    assert api.requests[1:3] == [("getFile", {"file_id": "synthetic-id"}), ("GET", f"/file/bot{TOKEN}/{FILE_PATH}")]
+    reply = api.sent()[0]["text"]
+    expected = transcription.draft if len(draft) < 100 else "😀" * 10
+    assert reply.startswith("전사 초안: " + expected)
+    assert reply.endswith("질문하려면 이 내용을 텍스트로 보내세요.")
+    assert len(reply.encode("utf-16-le")) // 2 <= telegram._CHUNK_LIMIT
+    assert transcription.created == 1 and transcription.calls == [Audio(AUDIO, "audio/mp4")]
+    assert engine.calls == enabled.calls == store.pending_deliveries() == [] and enabled.created == 0
+    assert store.get_offset()[0] == 41
+    assert store.get_approval(proposal.id) == proposal
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM approvals").fetchone()[0] == 1
+    assert set(tmp_path.rglob("*")) == before_files
+    persisted = dump(store)
+    assert transcription.draft not in persisted and AUDIO.hex() not in persisted
+    assert Store.search(store, "synthetic transcript")[1] == []
+    record = store.by_update_key("40:101")
+    assert (record.kind, record.request, record.items, record.reason) == ("notice", "", (), "voice_attempted")
+
+
+@pytest.mark.parametrize(("code", "message"), [
+    ("config", "음성 입력 설정"), ("format", "음성 형식"),
+    ("timeout", "시간이 초과"), ("provider", "전사 서비스에 오류"),
+])
+def test_stt_failure_notices_are_safe(api, store, transcription, tmp_path, caplog, capsys, code, message):
+    set_stt(tmp_path, "enabled = true\nstt = true\n")
+    key = "synthetic-provider-value"
+    sensitive = f"{TOKEN} {FILE_PATH} {key}"
+    transcription.error = ElevenLabsConfigError(sensitive) if code == "config" else ElevenLabsError(code, sensitive)
+    api.updates(audio_update())
+    file_info(api)
+    api.add("GET", body=AUDIO)
+    api.reply()
+    bot(api, store, FakeEngine()).poll_once()
+    notice = api.sent()[0]["text"]
+    assert message in notice
+    captured = capsys.readouterr()
+    output = notice + dump(store) + caplog.text + captured.out + captured.err
+    assert all(value not in output for value in (TOKEN, FILE_PATH, key))
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_stt_failed_reply_is_not_replayed(api, store, transcription, tmp_path, monkeypatch, interrupted):
+    set_stt(tmp_path, "enabled = true\nstt = true\n")
+    item = audio_update()
+    api.updates(item)
+    file_info(api)
+    api.add("GET", body=AUDIO)
+    poller = bot(api, store, FakeEngine())
+    expected = ["getUpdates", "getFile", "GET"]
+    if interrupted:
+        respond = poller._response
+
+        def interrupt_reply(method, payload):
+            if method == "sendMessage":
+                raise KeyboardInterrupt
+            return respond(method, payload)
+
+        monkeypatch.setattr(poller, "_response", interrupt_reply)
+        with pytest.raises(KeyboardInterrupt):
+            poller.poll_once()
+        assert store.get_offset() is None
+    else:
+        api.add("sendMessage", 503)
+        poller.poll_once()
+        expected.append("sendMessage")
+
+    api.updates(item)
+    reopened = Store.open(tmp_path)
+    bot(api, reopened, FakeEngine()).poll_once()
+    assert methods(api) == expected + ["getUpdates"]
+    assert reopened.get_offset()[0] == 41
+    assert reopened.pending_deliveries() == [] and transcription.created == 1

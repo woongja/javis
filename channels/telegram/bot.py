@@ -5,26 +5,42 @@ import json
 import logging
 import random
 import re
+import socket
 import time
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from threading import Timer
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request as HTTPRequest, build_opener
 from uuid import uuid4
 
 from core.approval import ApprovalService, Executor
+from core.config import VoiceSettingsError, data_dir, load_voice_settings
 from core.engine import Engine
 from core.gateway import Request, handle
 from core.note import NOTE_EXECUTORS
 from core.voice import Audio, voice_for
+from core.voice_elevenlabs import ElevenLabsError
 from worklog.store import ApprovalKind, Record, Store
 
 _API_BASE = "https://api.telegram.org"
 _POLL_TIMEOUT = 25
 _HTTP_TIMEOUT = 35
 _MAX_VOICE_UPLOAD = 20 * 1024 * 1024
+_MAX_VOICE_DOWNLOAD = 10 * 1024 * 1024
+_MAX_VOICE_DURATION = 120
+_VOICE_DOWNLOAD_TIMEOUT = 15
+_VOICE_INPUT_TYPES = {"audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav"}
+_FILE_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+_STT_ERRORS = {
+    "config": "음성 입력 설정을 확인해 주세요.",
+    "format": "음성 형식을 처리할 수 없습니다.",
+    "timeout": "음성 입력 처리 시간이 초과되었습니다.",
+    "provider": "음성 전사 서비스에 오류가 발생했습니다.",
+}
 # Use sendVoice for OGG/Opus and attach other provider formats as documents.
 _VOICE_FILES = {
     "audio/ogg": ("sendVoice", "voice", "reply.ogg"),
@@ -184,6 +200,133 @@ class TelegramBot:
             self._upload_voice(audio)
         except Exception:
             _LOG.warning("Telegram voice upload failed")
+
+    def _read_voice_file(self, path: str, limit: int, deadline: float, payload: bytes | None = None) -> bytes:
+        base = urlsplit(self._api_base)
+        if base.scheme == "https" and base.hostname:
+            connect = http.client.HTTPSConnection
+        elif base.scheme == "http" and base.hostname == "127.0.0.1":
+            # The injected local fake API also serves the file route.
+            connect = http.client.HTTPConnection
+        else:
+            raise ValueError("invalid Telegram origin")
+
+        def remaining() -> float:
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError
+            return seconds
+
+        with closing(connect(base.hostname, base.port, timeout=remaining())) as connection:
+            connection.connect()
+            transport = connection.sock
+
+            def interrupt() -> None:
+                try:
+                    transport.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            # Enforce the deadline even if the server trickles headers or body bytes.
+            timer = Timer(remaining(), interrupt)
+            timer.daemon = True
+            timer.start()
+            try:
+                method = "GET" if payload is None else "POST"
+                headers = {} if payload is None else {"Content-Type": "application/json"}
+                connection.request(method, base.path + path, body=payload, headers=headers)
+                with closing(connection.getresponse()) as response:
+                    if response.status != 200 or (response.length is not None and response.length > limit):
+                        raise ValueError("invalid Telegram file response")
+                    data = response.read(limit + 1)
+                    if not data or len(data) > limit or response.length:
+                        raise ValueError("invalid Telegram file size")
+                    return data
+            finally:
+                timer.cancel()
+                remaining()
+
+    def _download_voice(self, file_id: str, size: int, media_type: str) -> Audio:
+        deadline = time.monotonic() + _VOICE_DOWNLOAD_TIMEOUT
+        bot_path = f"/bot{quote(self._token, safe=':')}"
+        payload = json.dumps({"file_id": file_id}).encode("ascii")
+        info = json.loads(self._read_voice_file(f"{bot_path}/getFile", 64 * 1024, deadline, payload))
+        result = info.get("result") if isinstance(info, dict) and info.get("ok") is True else None
+        path = result.get("file_path") if isinstance(result, dict) else None
+        if not isinstance(path, str) or not all(
+            _FILE_SEGMENT.fullmatch(segment) and segment not in {".", ".."} for segment in path.split("/")
+        ):
+            raise ValueError("invalid Telegram file path")
+        return Audio(self._read_voice_file(f"/file{bot_path}/{path}", size, deadline), media_type)
+
+    def _transcription_draft(self, message: dict, attachment) -> str:
+        if not self._direct_owner(message):
+            return "음성 입력은 설정된 개인 채팅에서 소유자가 직접 보낸 메시지만 처리합니다."
+        try:
+            settings = load_voice_settings(data_dir())
+        except (OSError, ValueError):
+            return _STT_ERRORS["config"]
+        # Disabled voice input gets a short notice and makes no file requests.
+        if not settings.enabled or not settings.stt:
+            return "음성 입력이 꺼져 있습니다."
+
+        file_id, media_type, size, duration = (
+            attachment.get(field) if isinstance(attachment, dict) else None
+            for field in ("file_id", "mime_type", "file_size", "duration")
+        )
+        if not (
+            isinstance(file_id, str) and file_id
+            and isinstance(media_type, str) and media_type in _VOICE_INPUT_TYPES
+            and type(size) is int and 0 < size <= _MAX_VOICE_DOWNLOAD
+            and type(duration) is int and 0 <= duration <= _MAX_VOICE_DURATION
+        ):
+            return "음성 형식, 크기 또는 길이가 허용 범위를 벗어났습니다."
+        try:
+            provider = voice_for("stt", settings)
+        except Exception:
+            return _STT_ERRORS["config"]
+        try:
+            audio = self._download_voice(file_id, size, media_type)
+        except TimeoutError:
+            return _STT_ERRORS["timeout"]
+        except (OSError, http.client.HTTPException, ValueError, RecursionError):
+            return "음성 파일을 다운로드하지 못했습니다."
+        try:
+            draft = provider.transcribe(audio)
+        except VoiceSettingsError:
+            return _STT_ERRORS["config"]
+        except ElevenLabsError as error:
+            return _STT_ERRORS.get(error.code, _STT_ERRORS["provider"])
+        except TimeoutError:
+            return _STT_ERRORS["timeout"]
+        except Exception:
+            return _STT_ERRORS["provider"]
+        if not isinstance(draft, str) or not draft.strip() or self._token in draft:
+            return _STT_ERRORS["format"]
+
+        prefix = "전사 초안: "
+        suffix = "\n\n질문하려면 이 내용을 텍스트로 보내세요."
+        # Leave room for the instructions and an ellipsis in a single Telegram message.
+        limit = _CHUNK_LIMIT - len(prefix + suffix) - 1
+        units = 0
+        for index, char in enumerate(draft):
+            units += 2 if ord(char) > 0xFFFF else 1
+            if units > limit:
+                draft = draft[:index] + "…"
+                break
+        return prefix + draft + suffix
+
+    def _handle_voice(self, message: dict, attachment, key: str) -> None:
+        # Persist the attempt before external calls so a replay never retranscribes audio.
+        self._store.save(Record(
+            id=None, created_at=self._now().astimezone(UTC).isoformat(), channel="telegram",
+            kind="notice", request="", items=(), status="ok", reason="voice_attempted",
+            engine=None, model=None, duration_s=None, ref_id=None, update_key=key,
+        ))
+        self._response("sendMessage", {
+            "chat_id": self._chat_id, "text": self._transcription_draft(message, attachment),
+            "link_preview_options": {"is_disabled": True},
+        })
 
     def _request(self, method: str, payload: dict):
         backoff = 1
@@ -355,6 +498,10 @@ class TelegramBot:
         words = text.split() if isinstance(text, str) else []
         if not private_owner_chat:
             self._deny(key)
+            self._advance(offset)
+            return
+        if "voice" in message or "audio" in message:
+            self._handle_voice(message, message.get("voice", message.get("audio")), key)
             self._advance(offset)
             return
         if not words:
