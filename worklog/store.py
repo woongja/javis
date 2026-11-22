@@ -13,6 +13,8 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal
 
+from .search import SearchIndex, SearchResult, SearchStatus
+
 
 @dataclass(frozen=True)
 class Item:
@@ -208,7 +210,18 @@ _MIGRATE_V3_TO_V4 = (
     _CREATE_RECORDS_NEW.format(record_kinds="'ask', 'recall', 'approval', 'local', 'notice'"),
     *_REBUILD_RECORDS,
 )
-_MIGRATIONS = (_SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3, _MIGRATE_V3_TO_V4)
+_MIGRATE_V4_TO_V5 = (
+    """
+    CREATE TABLE search_index (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        tokenizer TEXT CHECK (tokenizer IN ('trigram', 'unicode61'))
+    )
+    """,
+    "INSERT INTO search_index VALUES (1, NULL)",
+)
+_MIGRATIONS = (
+    _SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3, _MIGRATE_V3_TO_V4, _MIGRATE_V4_TO_V5,
+)
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
 
@@ -250,6 +263,7 @@ class Store:
 
     def __init__(self, path: Path):
         self._path = path
+        self._search_index: SearchIndex | None = None
 
     @classmethod
     def open(cls, data_dir: Path) -> "Store":
@@ -287,6 +301,8 @@ class Store:
                 for statement in _MIGRATIONS[next_version - 1]:
                     db.execute(statement)
                 db.execute("UPDATE schema_version SET version = ?", (next_version,))
+            store._search_index = SearchIndex(db)
+            store._search_index.synchronize(db)
         return store
 
     @contextmanager
@@ -326,6 +342,8 @@ class Store:
                 "SELECT id FROM records WHERE update_key = ?", (record.update_key,)
             ).fetchone()["id"]
         record_id = inserted["id"]
+        if self._search_index is not None and record.kind == "ask" and record.status == "ok":
+            self._search_index.add(db, record_id, record.request, (item.text for item in record.items))
         if chunks is not None:
             self._set_delivery(db, record_id, chunks)
         return record_id
@@ -588,6 +606,13 @@ class Store:
                 "SELECT * FROM records ORDER BY created_utc DESC, id DESC LIMIT ?", (max(n, 0),)
             ).fetchall()
         return [_read_record(row) for row in rows]
+
+    def search(self, query: str, limit: int = 20) -> tuple[SearchStatus, list[SearchResult]]:
+        """Return newest matching web records. Degraded search matches whole tokens for longer terms."""
+        if self._search_index is None:
+            return ("unavailable" if query.split() else "usage"), []
+        with self._connect() as db:
+            return self._search_index.search(db, query, limit)
 
     def last_ok_ask(self) -> Record | None:
         with self._connect() as db:
