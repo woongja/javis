@@ -14,6 +14,49 @@ class EngineSettings:
     timeout_s: float = 300
 
 
+@dataclass(frozen=True)
+class VoiceSettings:
+    enabled: bool = False
+    tts: bool = False
+    stt: bool = False
+    tts_provider: str = "local"
+    stt_provider: str = "none"
+
+
+class VoiceSettingsError(ValueError):
+    pass
+
+
+def _voice_values(document: dict) -> dict:
+    values = document.get("voice", {})
+    if not isinstance(values, dict):
+        raise VoiceSettingsError("[voice] must be a table")
+    for key, value in values.items():
+        if key in ("enabled", "tts", "stt"):
+            if type(value) is not bool:
+                raise VoiceSettingsError(f"voice.{key} must be a boolean")
+        elif key in ("tts_provider", "stt_provider"):
+            if not isinstance(value, str) or not value.strip():
+                raise VoiceSettingsError(f"voice.{key} must be a nonempty string")
+        else:
+            raise VoiceSettingsError("unknown key in [voice]")
+    return values
+
+
+def load_voice_settings(directory: Path) -> VoiceSettings:
+    try:
+        with files("core").joinpath("settings.toml").open("rb") as source:
+            defaults = _voice_values(tomllib.load(source))
+        try:
+            with (directory / "settings.toml").open("rb") as source:
+                overrides = _voice_values(tomllib.load(source))
+        except FileNotFoundError:
+            overrides = {}
+    except (OSError, tomllib.TOMLDecodeError, UnicodeError):
+        raise VoiceSettingsError("could not read voice settings.toml") from None
+    return VoiceSettings(**(defaults | overrides))
+
+
 def load_settings() -> EngineSettings:
     with files("core").joinpath("settings.toml").open("rb") as source:
         engine = tomllib.load(source).get("engine", {})

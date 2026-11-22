@@ -12,6 +12,16 @@ from threading import Thread
 
 OUTPUT_LIMIT = 1024 * 1024  # Per output stream, in bytes.
 _CREATE_SUSPENDED = 0x00000004
+_ENV = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "OS",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME", "APPDATA", "LOCALAPPDATA",
+    "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+}
+
+
+def process_env() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key.upper() in _ENV}
 
 
 class OutputLimitExceeded(Exception):

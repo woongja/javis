@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from worklog.store import Item
 
-from ._process import OutputLimitExceeded, run_bounded
+from ._process import OutputLimitExceeded, process_env, run_bounded
 from .config import EngineSettings
 
 Status = Literal["ok", "error", "timeout", "quota", "denied"]
@@ -35,12 +35,6 @@ _OPTIONS = (
     "--tools", "WebSearch", "--allowedTools", "WebSearch", "--no-session-persistence",
     "--system-prompt", _SYSTEM_PROMPT,
 )
-_ENV = {
-    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "OS",
-    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME", "APPDATA", "LOCALAPPDATA",
-    "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
-    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
-}
 _QUOTA = re.compile(
     r"\b(?:rate[_ -]limit(?:ed|[_ -]exceeded|[_ -]error)?|usage (?:limit|cap)|"
     r"(?:hit|reached) (?:your |the )?limit|out of (?:extra )?usage|quota (?:exceeded|exhausted))\b",
@@ -142,7 +136,7 @@ class ClaudeEngine:
                 args.insert(0, sys.executable)
             if self.settings.model:
                 args.extend(("--model", self.settings.model))
-            env = {key: value for key, value in os.environ.items() if key.upper() in _ENV}
+            env = process_env()
             with tempfile.TemporaryDirectory(prefix="javis-engine-") as folder:
                 code, stdout, stderr = run_bounded(
                     args, text.encode("utf-8"), Path(folder), env, self.settings.timeout_s,

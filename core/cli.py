@@ -16,12 +16,13 @@ from harness.paths import env_value, repo_root
 from worklog import Store
 
 from .approval import ApprovalService, is_interrupted, os_user as _os_user
-from .config import data_dir, load_settings
+from .config import VoiceSettingsError, data_dir, load_settings, load_voice_settings
 from .engine import ClaudeEngine
 from .gateway import Request, handle
 from .note import NOTE_EXECUTORS, approval_summary, decide_on_pc, planned_copy
 from .recall import question_preview
 from .search import search_reply
+from .voice import save_audio, voice_for
 
 
 def _count(value: str) -> int:
@@ -140,6 +141,38 @@ def _brain_import_preview(manifest: dict, count: int) -> None:
         print(f"  외 {len(files) - limit}건")
 
 
+def _voice_status(directory: Path) -> int:
+    try:
+        settings = load_voice_settings(directory)
+    except VoiceSettingsError as error:
+        print(f"javis: voice configuration error: {error}", file=sys.stderr)
+        return 1
+    print(f"enabled={str(settings.enabled).lower()}")
+    code = 0
+    for direction in ("tts", "stt"):
+        enabled = str(getattr(settings, direction)).lower()
+        provider = getattr(settings, f"{direction}_provider")
+        try:
+            availability = "yes" if voice_for(direction, settings) is not None else "no (disabled)"
+        except VoiceSettingsError as error:
+            availability = f"no (configuration error: {error})"
+            code = 1
+        print(f"{direction}={enabled} provider={provider!r} available={availability}")
+    return code
+
+
+def _speak_answer(directory: Path, text: str) -> None:
+    try:
+        provider = voice_for("tts", load_voice_settings(directory))
+        if provider is not None:
+            print(save_audio(directory, provider.synthesize(text)).as_posix())
+    except VoiceSettingsError as error:
+        print(f"javis: voice configuration error: {error}", file=sys.stderr)
+    except Exception:
+        # Provider errors can contain answer text or subprocess diagnostics.
+        print("javis: voice synthesis failed", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     external = "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다."
     parser = argparse.ArgumentParser(
@@ -148,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     ask = commands.add_parser("ask", help="Ask a question or recall saved sources", epilog=external)
     ask.add_argument("text")
+    voice = commands.add_parser("voice", help="Show voice settings and availability")
+    voice.add_subparsers(dest="voice_action", required=True).add_parser("status", help="Show voice status")
     log = commands.add_parser("log", help="Show recent worklog entries")
     log.add_argument("-n", metavar="N", type=_count, default=20)
     search = commands.add_parser("search", help="Search saved web questions and answers")
@@ -199,6 +234,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if args.command == "voice":
+        return _voice_status(directory)
 
     if args.command in ("ask", "serve"):
         try:
@@ -254,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
         saved = store.get(reply.record_id)
         if saved is not None:
             print(reply.text)
+            if reply.kind == "web" and saved.status == "ok":
+                _speak_answer(directory, "\n".join(item.text for item in saved.items))
             return 0 if saved.status == "ok" else 1
     except (OSError, sqlite3.Error):
         pass
