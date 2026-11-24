@@ -75,6 +75,33 @@ class Decision:
     approval: Approval | None = None  # Present only for a committed claim.
 
 
+@dataclass(frozen=True)
+class ForgetTarget:
+    id: int
+    created_at: str | None
+    kind: str | None
+    preview: str | None = field(repr=False)
+    update_key: str | None
+    protected: bool
+
+
+# Note proposal replies have no stored proposal key and share the approval's creation time and channel.
+_FORGET_FIELDS = """
+    records.created_at, records.kind, substr(records.request, 1, 40), records.update_key,
+    EXISTS (
+        SELECT 1 FROM approvals
+        WHERE status IN ('pending', 'executing') AND (
+            decision_update_key = records.update_key
+            OR (
+                approvals.kind = 'note.create' AND approvals.allowed_channel = records.channel
+                AND records.kind = 'approval'
+                AND records.reason = 'proposed' AND approvals.created_at = records.created_utc
+            )
+        )
+    )
+"""
+
+
 _BUSY_TIMEOUT = 5.0
 _SCHEMA_V1 = (
     """
@@ -594,6 +621,64 @@ class Store:
         with self._connect() as db:
             row = db.execute("SELECT * FROM records WHERE id = ?", (id,)).fetchone()
         return _read_record(row) if row is not None else None
+
+    def forget_targets(
+        self, ids: Collection[int], *, before: datetime | None = None,
+    ) -> list[ForgetTarget]:
+        with self._connect() as db:
+            if before is None:
+                return self._forget_by_id(db, ids)
+            rows = db.execute(
+                f"""
+                SELECT records.id, {_FORGET_FIELDS} FROM records
+                WHERE created_utc < ? ORDER BY created_utc, id
+                """,
+                (_approval_time(before),),
+            )
+            return [ForgetTarget(*row) for row in rows]
+
+    @staticmethod
+    def _forget_by_id(db: sqlite3.Connection, ids: Collection[int]) -> list[ForgetTarget]:
+        rows = db.execute(
+            f"""
+            SELECT wanted.value, {_FORGET_FIELDS} FROM json_each(?) AS wanted
+            LEFT JOIN records ON records.id = wanted.value ORDER BY wanted.key
+            """,
+            (json.dumps(list(dict.fromkeys(ids))),),
+        )
+        return [ForgetTarget(*row) for row in rows]
+
+    def forget(self, targets: list[ForgetTarget]) -> tuple[int, list[ForgetTarget], bool, tuple[str, ...]]:
+        """Return the deleted count, changed targets, WAL status, and unclean FTS tables."""
+        confirmed = {
+            target.id: target for target in targets if target.created_at is not None and not target.protected
+        }
+        with self._connect() as db:
+            db.execute("PRAGMA secure_delete = ON")
+            db.execute("BEGIN IMMEDIATE")
+            deleted = []
+            skipped = []
+            for current in self._forget_by_id(db, confirmed):
+                # IDs can be reused after deletion. Recheck the preview and approval link under the write lock.
+                if current == confirmed[current.id]:
+                    deleted.append(current.id)
+                else:
+                    skipped.append(current)
+            unclean_indexes = ()
+            if deleted:
+                ids = json.dumps(deleted)
+                unclean_indexes = SearchIndex.remove(db, ids)
+                db.execute("DELETE FROM deliveries WHERE record_id IN (SELECT value FROM json_each(?))", (ids,))
+                db.execute("UPDATE records SET ref_id = NULL WHERE ref_id IN (SELECT value FROM json_each(?))", (ids,))
+                db.execute("DELETE FROM records WHERE id IN (SELECT value FROM json_each(?))", (ids,))
+
+            # Commit the secure deletions, then TRUNCATE the WAL to remove its older page images.
+            db.commit()
+            try:
+                busy = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            except sqlite3.Error:
+                return len(deleted), skipped, False, unclean_indexes
+            return len(deleted), skipped, busy == 0, unclean_indexes
 
     def by_update_key(self, key: str) -> Record | None:
         with self._connect() as db:

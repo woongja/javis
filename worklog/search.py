@@ -75,6 +75,26 @@ class SearchIndex:
             (id, question, "\n".join(bodies)),
         )
 
+    @staticmethod
+    def remove(db: sqlite3.Connection, ids: str) -> tuple[str, ...]:
+        """Remove index copies and return tables that could not be cleaned."""
+        unclean = []
+        # Tokenizer switches can leave a second index containing copies of the records.
+        for table in _TABLES.values():
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone() is None:
+                continue
+            try:
+                removed = db.execute(f"DELETE FROM {table} WHERE rowid IN (SELECT value FROM json_each(?))", (ids,))
+                if removed.rowcount:
+                    # Merge away FTS5 deletion markers and the old terms they mask.
+                    db.execute(f"INSERT INTO {table} ({table}) VALUES ('optimize')")
+            except sqlite3.OperationalError:
+                if not db.in_transaction:
+                    raise
+                # An older runtime may lack FTS5 or the tokenizer used to create this table.
+                unclean.append(table)
+        return tuple(unclean)
+
     def search(self, db: sqlite3.Connection, query: str, limit: int) -> tuple[SearchStatus, list[SearchResult]]:
         terms = dict.fromkeys(query.split())
         if not terms:

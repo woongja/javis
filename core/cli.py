@@ -4,7 +4,8 @@ import argparse
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from collections import Counter
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 
 from brain import Unavailable, _display
@@ -34,6 +35,72 @@ def _count(value: str) -> int:
     if not 0 <= count <= 2**63 - 1:
         raise argparse.ArgumentTypeError("N must be a nonnegative integer within the SQLite range")
     return count
+
+
+def _forget_before(value: str) -> datetime:
+    try:
+        day = date.fromisoformat(value)
+        if day.isoformat() == value:
+            return datetime.combine(day, time.min).astimezone(UTC)
+    except (ValueError, OverflowError, OSError):
+        pass
+    raise argparse.ArgumentTypeError("날짜를 YYYY-MM-DD 형식으로 입력해 주세요.")
+
+
+def _forget_summary(deleted: int, skipped: int) -> None:
+    print(f"삭제 {deleted}건 · 건너뜀 {skipped}건")
+
+
+def _forget(store: Store, ids: list[int], before: datetime | None, yes: bool) -> int:
+    targets = store.forget_targets(ids, before=before)
+    eligible = sum(target.created_at is not None and not target.protected for target in targets)
+    protected_message = "진행 중인 승인과 연결됨"
+    if before is not None:
+        print(f"삭제 대상 {eligible}건")
+        protected = sum(target.protected for target in targets)
+        if protected:
+            print(f"{protected_message} {protected}건")
+    else:
+        for target in targets:
+            if target.created_at is None:
+                print(f"{target.id}\t없음")
+                continue
+            local = datetime.fromisoformat(target.created_at).astimezone()
+            line = f"{target.id}\t{local:%Y-%m-%d %H:%M:%S}\t{target.kind}\t{_approval_preview(target.preview or '')}"
+            print(f"{line}\t{protected_message}" if target.protected else line)
+
+    if eligible and not yes:
+        try:
+            confirmed = input("삭제하시겠습니까? [y/N] ").strip().lower() == "y"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            confirmed = False
+        if not confirmed:
+            _forget_summary(0, len(targets))
+            return 0
+
+    deleted, changed, wal_clean, unclean_indexes = store.forget(targets)
+    changed_counts: Counter[str] = Counter()
+    for target in changed:
+        if target.protected:
+            reason = protected_message
+        elif target.created_at is None:
+            reason = "없음"
+        else:
+            reason = "확인 후 기록이 변경됨"
+        if before is None:
+            print(f"{target.id}\t{reason}")
+        else:
+            changed_counts[reason] += 1
+    for reason, count in changed_counts.items():
+        print(f"{reason} {count}건")
+    _forget_summary(deleted, len(targets) - deleted)
+    if unclean_indexes:
+        tables = ", ".join(unclean_indexes)
+        print(f"검색 인덱스 정리 못 함 ({tables}). 삭제한 본문이 인덱스에 남아 있을 수 있습니다.", file=sys.stderr)
+    if not wal_clean:
+        print("WAL 정리를 완료하지 못했습니다. DB를 사용 중인 작업이 끝난 뒤 다시 실행해 주세요.", file=sys.stderr)
+    return int(bool(unclean_indexes) or not wal_clean)
 
 
 def _telegram_settings() -> tuple[str, int] | None:
@@ -196,6 +263,10 @@ def main(argv: list[str] | None = None) -> int:
     log.add_argument("-n", metavar="N", type=_count, default=20)
     search = commands.add_parser("search", help="Search saved web questions and answers")
     search.add_argument("terms", metavar="검색어", nargs="+")
+    forget = commands.add_parser("forget", help="Delete saved records on this PC")
+    forget.add_argument("ids", metavar="ID", type=_count, nargs="*")
+    forget.add_argument("--before", metavar="YYYY-MM-DD", type=_forget_before)
+    forget.add_argument("--yes", action="store_true", help="Skip confirmation")
     commands.add_parser("serve", help="Serve requests from Telegram")
     commands.add_parser("hud", help="Serve the HUD on a local loopback port")
     commands.add_parser("pending", help="List actionable approvals and interrupted runs")
@@ -216,6 +287,13 @@ def main(argv: list[str] | None = None) -> int:
         query = " ".join(args.terms)
         if not query.strip():
             search.error("검색어를 입력해 주세요.")
+    if args.command == "forget":
+        if bool(args.ids) == (args.before is not None):
+            forget.error("기록 ID 또는 --before 날짜를 지정해 주세요.")
+        if not args.yes and not sys.stdin.isatty():
+            print("비대화형 실행에는 --yes가 필요합니다.", file=sys.stderr)
+            _forget_summary(0, 0)
+            return 1
 
     if args.command == "brain" and args.brain_action == "import":
         try:
@@ -291,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
                 search.error("검색어를 입력해 주세요.")
             print(message, file=sys.stderr if status == "unavailable" else sys.stdout)
             return 1 if status == "unavailable" else 0
+        if args.command == "forget":
+            return _forget(store, args.ids, args.before, args.yes)
         if args.command == "pending":
             return _list_pending(store, _os_user())
         if args.command in ("approve", "reject"):

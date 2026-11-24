@@ -77,6 +77,10 @@ recall sources for a matching result. For the HUD, open the address printed
 in the terminal and enter the one-time code. The HUD listens only on
 `127.0.0.1`.
 
+On the PC, run `uv run javis forget <ID> [<ID> ...]` to delete specific records.
+Run `uv run javis forget --before YYYY-MM-DD` to delete records older than the start of that date in local time.
+Review the preview and enter `y` to confirm, or use `--yes` to skip confirmation.
+
 ### Voice
 
 Voice is off by default. To enable local text-to-speech, add this to
