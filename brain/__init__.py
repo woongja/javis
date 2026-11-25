@@ -4,7 +4,7 @@ import ctypes
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from heapq import nsmallest
 from itertools import islice
@@ -14,7 +14,7 @@ from core.config import data_dir
 from harness import HarnessError
 from harness.paths import env_value, repo_root
 
-from .policy import Rejected, relative_parts
+from .policy import Policy, Rejected, relative_parts
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SCAN_ENTRIES = 5000
@@ -126,15 +126,18 @@ def _read_markdown(path: Path, info: os.stat_result) -> str | None:
         return None
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    with open(path, "rb", opener=lambda name, _: os.open(name, flags)) as source:
+    with open(path, "rb", buffering=0, opener=lambda name, _: os.open(name, flags)) as source:
         opened = os.fstat(source.fileno())
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or not os.path.samestat(info, opened):
             raise OSError("vault entry changed")
         if path.resolve(strict=True) != path:
             raise OSError("vault entry was redirected")
-        data = source.read(MAX_FILE_BYTES + 1)
-    if len(data) > MAX_FILE_BYTES:
-        return None
+        if opened.st_size != info.st_size:
+            raise OSError("vault entry changed")
+        data = source.read(info.st_size)
+        after = os.fstat(source.fileno())
+        if len(data) != info.st_size or after.st_size != info.st_size or after.st_mtime_ns != opened.st_mtime_ns:
+            raise OSError("vault entry changed")
     return data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -160,47 +163,47 @@ def _display(text: str) -> str:
     return "".join(char if char.isprintable() else "?" for char in text)
 
 
-def search(query: str) -> SearchResult:
-    """Rank all query terms within a title or a single paragraph."""
-    from .publish import _hidden, search_policy
+@dataclass
+class _VaultScan:
+    read_failures: int = 0
+    omitted: bool = False
+    policy: Policy | None = None
 
-    terms = query.casefold().split()
-    if not terms:
-        return SearchResult((), 0, False)
-    root = _root()
-    read_failures = 0
-    omitted = False
+    def files(
+        self, root: Path, *, skip: Callable[[tuple[str, ...]], bool] | None = None,
+    ) -> Iterator[tuple[Path, os.stat_result]]:
+        from .publish import _hidden, search_policy
 
-    def candidates() -> Iterator[tuple[tuple[int, str, int], str]]:
-        nonlocal read_failures, omitted
         directories = [root]
         remaining = MAX_SCAN_ENTRIES
-        policy = None
         while directories:
             directory = directories.pop()
             if not remaining:
-                omitted = True
+                self.omitted = True
                 break
             try:
                 if _is_link(directory.lstat()) or directory.resolve(strict=True) != directory:
                     raise OSError("vault directory was redirected")
                 with os.scandir(directory) as entries:
-                    batch = list(islice(entries, remaining + 1))
+                    # The legacy search probes one extra entry for its omission indicator.
+                    # Context must stay within the hard limit, even for that probe.
+                    limit = remaining + 1 if skip is None else remaining
+                    batch = list(islice(entries, limit))
             except (OSError, RuntimeError):
-                read_failures += 1
+                self.read_failures += 1
                 continue
-            if len(batch) > remaining:
-                omitted = True
+            if len(batch) == limit:
+                self.omitted = True
                 if directory == root:
                     # An unseen policy or a second spelling could invalidate the entire search.
                     return
-                batch.pop()
+                del batch[remaining:]
             remaining -= len(batch)
             if directory == root:
                 try:
-                    policy = search_policy(root, batch)
+                    self.policy = search_policy(root, batch)
                 except (OSError, RuntimeError, Rejected):
-                    read_failures += 1
+                    self.read_failures += 1
                     return
             children = []
             for entry in sorted(batch, key=lambda entry: entry.name):
@@ -211,7 +214,9 @@ def search(query: str) -> SearchResult:
                     continue
                 path = directory / entry.name
                 relative = path.relative_to(root)
-                if policy is not None and policy.excludes(relative.parts):
+                if self.policy is not None and self.policy.excludes(relative.parts):
+                    continue
+                if skip is not None and skip(relative.parts):
                     continue
                 try:
                     info = path.lstat()
@@ -220,18 +225,35 @@ def search(query: str) -> SearchResult:
                     if stat.S_ISDIR(info.st_mode):
                         children.append(path)
                     elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and path.suffix.casefold() == ".md":
-                        content = _read_markdown(path, info)
-                        if content is None:
-                            omitted = True
-                            continue
-                        for priority, index, passage in _matching_passages(content, path.stem, terms):
-                            yield (priority, relative.as_posix(), index), passage
+                        yield relative, info
                 except (OSError, RuntimeError, UnicodeError):
-                    read_failures += 1
+                    self.read_failures += 1
             directories.extend(reversed(children))
 
+
+def search(query: str) -> SearchResult:
+    """Rank all query terms within a title or a single paragraph."""
+    terms = query.casefold().split()
+    if not terms:
+        return SearchResult((), 0, False)
+    root = _root()
+    scan = _VaultScan()
+
+    def candidates() -> Iterator[tuple[tuple[int, str, int], str]]:
+        for relative, info in scan.files(root):
+            try:
+                content = _read_markdown(root / relative, info)
+            except (OSError, RuntimeError, UnicodeError):
+                scan.read_failures += 1
+                continue
+            if content is None:
+                scan.omitted = True
+                continue
+            for priority, index, passage in _matching_passages(content, relative.stem, terms):
+                yield (priority, relative.as_posix(), index), passage
+
     ranked = nsmallest(MAX_RESULTS + 1, candidates(), key=lambda candidate: candidate[0])
-    omitted |= len(ranked) > MAX_RESULTS
+    omitted = scan.omitted or len(ranked) > MAX_RESULTS
     matches = []
     for (_, relative, _), passage in ranked[:MAX_RESULTS]:
         excerpt = _display(" ".join(passage.split()))
@@ -239,4 +261,7 @@ def search(query: str) -> SearchResult:
             omitted = True
             excerpt = excerpt[:MAX_EXCERPT_CHARS - 1] + "…"
         matches.append(Match(_display(relative), excerpt))
-    return SearchResult(tuple(matches), read_failures, omitted)
+    return SearchResult(tuple(matches), scan.read_failures, omitted)
+
+
+from .context import context_candidates, search_terms
