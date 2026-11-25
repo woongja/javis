@@ -5,6 +5,7 @@ from datetime import datetime
 
 import pytest
 
+from core import cli
 from core.gateway import Request, handle
 from tests.test_core_recall import NoEngine
 from tests.test_worklog_store import SAMPLE
@@ -111,6 +112,34 @@ def test_indexes_only_successful_web_questions_and_answer_text(tmp_path):
     assert [hit.id for hit in store.search("publicrequest publicanswer")[1]] == [record_id]
     for term in hidden:
         assert store.search(term) == ("ok", []), term
+        assert store.context_excerpts((term,)) == [], term
+
+
+def test_context_unions_five_per_term_and_projects_one_matching_passage(tmp_path):
+    store = Store.open(tmp_path)
+    overlap = store.save(replace(WEB_RECORD, request="빛", items=(Item("지난 일!전시에서 빛 확인. 끝.", ()),)))
+    only_question = store.save(replace(WEB_RECORD, request="앞 문장. 전시 일정?"))
+    ids = [store.save(replace(WEB_RECORD, request=f"빛 {i}")) for i in range(6)]
+    excerpts = {r.id: r for r in store.context_excerpts(("빛", "전시에서", "전시", "빛"))}
+    assert set(excerpts) == {overlap, only_question, *ids[-5:]}
+    assert excerpts[overlap].excerpt == "전시에서 빛 확인."
+    assert excerpts[overlap].matched_terms == 3
+    assert excerpts[only_question].excerpt == "전시 일정?"
+    assert all(excerpts[i].matched_terms == 1 for i in ids[-5:])
+    assert [r.id for r in store.search("빛 전시")[1]] == [overlap]
+
+
+def test_cli_search_keeps_latest_first_and_requires_all_terms(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    store = Store.open(tmp_path)
+    old = store.save(replace(WEB_RECORD, request="기존 전시", items=(Item("빛 확인", ()),)))
+    new = store.save(replace(WEB_RECORD, request="전시 빛", created_at="2026-11-22T00:00:00Z"))
+    single = store.save(replace(WEB_RECORD, request="빛 한 단어"))
+    assert {r.id for r in store.context_excerpts(("빛", "전시"))} == {old, new, single}
+    assert cli.main(["search", "빛", "전시"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"{new}\t2026-11-22\t전시 빛", f"{old}\t2026-11-21\t기존 전시", '출처는 `javis ask "출처 <ID>"`',
+    ]
 
 
 def test_switches_tokenizers_and_rebuilds(tmp_path, monkeypatch):
@@ -122,6 +151,7 @@ def test_switches_tokenizers_and_rebuilds(tmp_path, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(search_module, "_detect_tokenizer", lambda db: "unicode61")
         degraded = Store.open(tmp_path)
+        assert store.context_excerpts(("회의",)) is None  # Another process changed the active index.
         assert degraded.search("의에서") == ("degraded", [])
         assert [hit.id for hit in degraded.search("회의에서 회의")[1]] == [original]
         added = degraded.save(replace(WEB_RECORD, request="회의에서 후속"))

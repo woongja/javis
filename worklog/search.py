@@ -1,6 +1,7 @@
 """Free search over the questions and answer text of successful web requests."""
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -18,9 +19,19 @@ class SearchResult:
     preview: str
 
 
+@dataclass(frozen=True)
+class RecordExcerpt:
+    id: int
+    created_utc: str
+    excerpt: str
+    matched_terms: int
+
+
 _TABLES: dict[Tokenizer, str] = {"trigram": "search_trigram", "unicode61": "search_unicode61"}
 _PREVIEW_LENGTH = 80
 _MAX_RESULTS = 20
+_CONTEXT_RESULTS_PER_TERM = 5
+_SENTENCE_BREAK = re.compile(r"""[\r\n]+|(?<=[.!?。！？])\s+|(?<=[.!?。！？]["'”’])\s+|(?<=[!?。！？])(?=\w)""")
 
 
 def _detect_tokenizer(db: sqlite3.Connection) -> Tokenizer | None:
@@ -44,7 +55,10 @@ class SearchIndex:
 
     @staticmethod
     def _active_tokenizer(db: sqlite3.Connection) -> str | None:
-        return db.execute("SELECT tokenizer FROM search_index WHERE singleton = 1").fetchone()[0]
+        row = db.execute("SELECT tokenizer FROM search_index WHERE singleton = 1").fetchone()
+        if row is None:
+            raise sqlite3.DatabaseError("missing worklog search index state")
+        return row[0]
 
     def synchronize(self, db: sqlite3.Connection) -> bool:
         """Rebuild on a capability change. The caller holds the write transaction."""
@@ -95,24 +109,10 @@ class SearchIndex:
                 unclean.append(table)
         return tuple(unclean)
 
-    def search(self, db: sqlite3.Connection, query: str, limit: int) -> tuple[SearchStatus, list[SearchResult]]:
-        terms = dict.fromkeys(query.split())
-        if not terms:
-            return "usage", []
-        if self._tokenizer is None:
-            return "unavailable", []
-        status: SearchStatus = "ok" if self._tokenizer == "trigram" else "degraded"
-        # FTS5 terminates the MATCH expression at a NUL byte.
-        if any(len(term) >= 3 and "\0" in term for term in terms):
-            return status, []
-
-        db.execute("BEGIN")
-        if self._active_tokenizer(db) != self._tokenizer:
-            # Another process may have switched capabilities since this store opened.
-            db.rollback()
-            db.execute("BEGIN IMMEDIATE")
-            self.synchronize(db)
-
+    def _matches(
+        self, db: sqlite3.Connection, terms: tuple[str, ...], limit: int, columns: str,
+        *, fold_short_terms: bool = False,
+    ) -> Iterable[sqlite3.Row]:
         table = _TABLES[self._tokenizer]
         clauses = []
         params = []
@@ -123,22 +123,93 @@ class SearchIndex:
         short_terms = [term for term in terms if len(term) < 3]
         if short_terms:
             values = ", ".join("(?)" for _ in short_terms)
+            question, body = "question", "body"
+            if fold_short_terms:
+                question, body = "casefold(question)", "casefold(body)"
+                short_terms = [term.casefold() for term in short_terms]
             clauses.append(
                 f"NOT EXISTS (SELECT 1 FROM (VALUES {values}) AS terms "
-                "WHERE instr(question, terms.column1) = 0 AND instr(body, terms.column1) = 0)"
+                f"WHERE instr({question}, terms.column1) = 0 AND instr({body}, terms.column1) = 0)"
             )
             params.extend(short_terms)
         params.append(max(0, min(limit, _MAX_RESULTS)))
-        rows = db.execute(
+        return db.execute(
             f"""
-            SELECT records.id, records.created_utc, records.request
+            SELECT {columns}
             FROM {table} JOIN records ON records.id = {table}.rowid
-            WHERE {" AND ".join(clauses)}
+            WHERE records.kind = 'ask' AND records.status = 'ok' AND {" AND ".join(clauses)}
             ORDER BY records.created_utc DESC, records.id DESC LIMIT ?
             """,
             params,
         )
+
+    def search(self, db: sqlite3.Connection, query: str, limit: int) -> tuple[SearchStatus, list[SearchResult]]:
+        terms = tuple(dict.fromkeys(query.split()))
+        if not terms:
+            return "usage", []
+        if self._tokenizer is None:
+            return "unavailable", []
+        status: SearchStatus = "ok" if self._tokenizer == "trigram" else "degraded"
+        # FTS5 terminates the MATCH expression at a NUL byte.
+        if any(len(term) >= 3 and "\0" in term for term in terms):
+            return status, []
+        db.execute("BEGIN")
+        if self._active_tokenizer(db) != self._tokenizer:
+            # Another process may have switched capabilities since this store opened.
+            db.rollback()
+            db.execute("BEGIN IMMEDIATE")
+            self.synchronize(db)
+        rows = self._matches(db, terms, limit, "records.id, records.created_utc, records.request")
         return status, [SearchResult(id, timestamp[:10], _preview(question)) for id, timestamp, question in rows]
+
+    def context_excerpts(self, db: sqlite3.Connection, terms: tuple[str, ...]) -> list[RecordExcerpt] | None:
+        if self._tokenizer != "trigram":
+            return None
+        db.execute("BEGIN")
+        if self._active_tokenizer(db) != "trigram":
+            return None
+        terms = tuple(dict.fromkeys(term for term in terms if term and "\0" not in term))
+        db.create_function("casefold", 1, str.casefold, deterministic=True)
+        ids: set[int] = set()
+        for term in terms:
+            rows = self._matches(db, (term,), _CONTEXT_RESULTS_PER_TERM, "records.id", fold_short_terms=True)
+            ids.update(row[0] for row in rows)
+        if not ids:
+            return []
+        rows = db.execute(
+            """SELECT records.id, created_utc, question, body
+               FROM records JOIN search_trigram ON records.id = search_trigram.rowid
+               WHERE records.id IN (SELECT value FROM json_each(?))
+                 AND kind = 'ask' AND status = 'ok'""",
+            (json.dumps(list(ids)),),
+        )
+
+        excerpts = []
+        for record_id, created, question, body in rows:
+            excerpt, count = _matching_excerpt(terms, body, question)
+            if excerpt:
+                excerpts.append(RecordExcerpt(record_id, created, excerpt, count))
+        return excerpts
+
+
+def _matching_excerpt(terms: tuple[str, ...], body: str, question: str) -> tuple[str, int]:
+    """Score the whole record, preferring its best matching answer sentence."""
+    folded_terms = {term.casefold() for term in terms}
+    matched = set()
+    excerpt = ""
+    for field in (body, question):
+        best = ""
+        best_count = 0
+        for sentence in _SENTENCE_BREAK.split(field):
+            folded = sentence.casefold()
+            hits = {term for term in folded_terms if term in folded}
+            matched.update(hits)
+            if len(hits) > best_count:
+                best = sentence.strip()
+                best_count = len(hits)
+        if not excerpt:
+            excerpt = best
+    return excerpt, len(matched)
 
 
 def _preview(question: str) -> str:

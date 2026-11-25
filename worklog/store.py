@@ -13,7 +13,7 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal
 
-from .search import SearchIndex, SearchResult, SearchStatus
+from .search import RecordExcerpt, SearchIndex, SearchResult, SearchStatus
 
 
 @dataclass(frozen=True)
@@ -698,6 +698,13 @@ class Store:
             return ("unavailable" if query.split() else "usage"), []
         with self._connect() as db:
             return self._search_index.search(db, query, limit)
+
+    def context_excerpts(self, terms: tuple[str, ...]) -> list[RecordExcerpt] | None:
+        """Read matching public passages in one snapshot. None means full FTS is unavailable."""
+        if self._search_index is None:
+            return None
+        with self._connect() as db:
+            return self._search_index.context_excerpts(db, terms)
 
     def last_ok_ask(self) -> Record | None:
         with self._connect() as db:
