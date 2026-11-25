@@ -8,10 +8,12 @@ import sqlite3
 import time
 from collections.abc import Callable, Collection, Iterator
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Literal
+
+from brain.policy import relative_parts
 
 from .search import RecordExcerpt, SearchIndex, SearchResult, SearchStatus
 
@@ -27,7 +29,7 @@ class Record:
     id: int | None
     created_at: str
     channel: str
-    kind: Literal["ask", "recall", "approval", "local", "notice"]
+    kind: Literal["ask", "recall", "approval", "local", "notice", "context", "private"]
     request: str
     items: tuple[Item, ...]
     status: Literal["ok", "error", "timeout", "quota", "denied"]
@@ -246,8 +248,30 @@ _MIGRATE_V4_TO_V5 = (
     """,
     "INSERT INTO search_index VALUES (1, NULL)",
 )
+_MIGRATE_V5_TO_V6 = (
+    _CREATE_RECORDS_NEW.format(record_kinds="'ask', 'recall', 'approval', 'local', 'notice', 'context', 'private'"),
+    *_REBUILD_RECORDS,
+    """
+    CREATE TABLE record_citations (
+        record_id INTEGER NOT NULL REFERENCES records (id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        note_path TEXT,
+        cited_id INTEGER REFERENCES records (id) ON DELETE CASCADE,
+        PRIMARY KEY (record_id, position),
+        CHECK ((note_path IS NULL) != (cited_id IS NULL))
+    )
+    """,
+    """
+    CREATE TRIGGER deliveries_reject_sensitive BEFORE INSERT ON deliveries
+    WHEN (SELECT kind FROM records WHERE id = NEW.record_id) IN ('context', 'private')
+    BEGIN
+        SELECT RAISE(ABORT, 'reply body cannot be queued for this record kind');
+    END
+    """,
+)
 _MIGRATIONS = (
     _SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3, _MIGRATE_V3_TO_V4, _MIGRATE_V4_TO_V5,
+    _MIGRATE_V5_TO_V6,
 )
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -339,12 +363,21 @@ class Store:
             db.execute("PRAGMA foreign_keys = ON")
             yield db
 
-    def save(self, record: Record, *, chunks: list[str] | None = None) -> int:
-        """Save a record and any initial delivery together. The DB assigns the ID."""
+    def save(
+        self, record: Record, *, chunks: list[str] | None = None, cited_sources: Collection[str | int] = (),
+    ) -> int:
+        """Save atomically. For context answers pass only locally resolved, used paths/IDs in citation order."""
         with self._connect() as db:
-            return self._save(db, record, chunks)
+            return self._save(db, record, chunks, cited_sources)
 
-    def _save(self, db: sqlite3.Connection, record: Record, chunks: list[str] | None) -> int:
+    def _save(
+        self, db: sqlite3.Connection, record: Record, chunks: list[str] | None,
+        cited_sources: Collection[str | int] = (),
+    ) -> int:
+        if record.kind in ("context", "private"):
+            record = replace(record, request="", items=(), reason=None, engine=None, model=None, ref_id=None)
+        elif cited_sources:
+            raise ValueError("citations require a context record")
         created_at = _utc_timestamp(record.created_at, "created_at")
         created_utc = created_at.astimezone(UTC).isoformat(timespec="microseconds")
         items = json.dumps([(item.text, item.sources) for item in record.items])
@@ -369,11 +402,46 @@ class Store:
                 "SELECT id FROM records WHERE update_key = ?", (record.update_key,)
             ).fetchone()["id"]
         record_id = inserted["id"]
+        if record.kind == "context" and record.status == "ok":
+            self._save_citations(db, record_id, cited_sources)
         if self._search_index is not None and record.kind == "ask" and record.status == "ok":
             self._search_index.add(db, record_id, record.request, (item.text for item in record.items))
         if chunks is not None:
             self._set_delivery(db, record_id, chunks)
         return record_id
+
+    @staticmethod
+    def _save_citations(db: sqlite3.Connection, id: int, sources: Collection[str | int]) -> None:
+        seen = set()
+        for position, source in enumerate(sources):
+            if isinstance(source, str):
+                source = "/".join(relative_parts(source))
+                if not source.casefold().endswith(".md"):
+                    raise ValueError("a citation requires a relative Markdown path")
+                path, cited_id = source, None
+            elif type(source) is int and 0 < source < 2**63:
+                if not db.execute(
+                    "SELECT 1 FROM records WHERE id = ? AND kind = 'ask' AND status = 'ok'", (source,)
+                ).fetchone():
+                    raise ValueError("a citation requires a successful web record")
+                path, cited_id = None, source
+            else:
+                raise ValueError("invalid citation")
+            if source not in seen:
+                db.execute("INSERT INTO record_citations VALUES (?, ?, ?, ?)", (id, position, path, cited_id))
+                seen.add(source)
+
+    def cited_sources(self, id: int) -> list[str | int]:
+        """Return cited note paths and public record IDs in their original order."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT coalesce(note_path, cited_id) FROM record_citations WHERE record_id = ? ORDER BY position",
+                (id,),
+            )
+            return [row[0] for row in rows]
+
+    def cited_paths(self, id: int) -> list[str]:
+        return [source for source in self.cited_sources(id) if isinstance(source, str)]
 
     def save_telegram_approval_reply(
         self, key: str, now: datetime, outcome: str, chunks: list[str],

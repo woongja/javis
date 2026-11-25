@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from core import cli
 from worklog import Item, Record, Store
 from worklog.store import _MIGRATIONS, _SCHEMA_VERSION
 
@@ -206,6 +207,80 @@ def test_delivery_save_and_permanent_failure_are_atomic(tmp_path):
         assert db.execute(
             "SELECT failure_reason FROM deliveries WHERE record_id = ?", (record_id,)
         ).fetchone() == ("forbidden",)
+
+
+def test_sensitive_records_keep_only_cited_sources_out_of_fts(tmp_path):
+    store = Store.open(tmp_path)
+    web_id = store.save(SAMPLE)
+    paths = ["notes/second.md", "notes/first.md"]
+    marker = "quotednotebodymarker"
+    answer = replace(
+        SAMPLE, request=f"question {marker}", items=(Item(f"verbatim excerpt {marker}", (marker,)),),
+        reason=marker, engine=marker, model=marker, ref_id=web_id,
+    )
+    db_path = tmp_path / "javis.db"
+    with closing(sqlite3.connect(db_path)) as db:
+        # Keep a connection open so the committed WAL frames can be inspected.
+        db.execute("SELECT count(*) FROM records").fetchone()
+        context = store.save(replace(answer, kind="context"), cited_sources=[paths[0], web_id, paths[1], paths[0]])
+        private = store.save(replace(answer, kind="private"), cited_sources=["notes/privateonly.md", web_id])
+        uncited = store.save(replace(answer, kind="context"))
+        for id, kind in [(context, "context"), (private, "private"), (uncited, "context")]:
+            assert store.get(id) == replace(
+                answer, id=id, kind=kind, request="", items=(), reason=None, engine=None, model=None, ref_id=None,
+            )
+        assert store.cited_sources(context) == [paths[0], web_id, paths[1]]
+        assert store.cited_paths(context) == paths
+        assert store.cited_sources(private) == store.cited_sources(uncited) == []
+        for rebuild in (False, True):
+            if rebuild:
+                with db:
+                    db.execute("UPDATE search_index SET tokenizer = NULL")
+                store = Store.open(tmp_path)
+            assert db.execute("SELECT rowid FROM search_trigram").fetchall() == [(web_id,)]
+            for term in (marker, "second", "privateonly"):
+                assert store.search(term) == ("ok", [])
+                assert store.context_excerpts((term,)) == []
+            # PASSIVE checkpoints committed pages without truncating the WAL.
+            db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            for file in (db_path, tmp_path / "javis.db-wal"):
+                data = file.read_bytes()
+                assert data and marker.encode() not in data and b"privateonly" not in data
+
+
+def test_citations_roll_back_and_replays_preserve_the_original(tmp_path):
+    store = Store.open(tmp_path)
+    record = replace(SAMPLE, kind="context", update_key="citation-test")
+    path = "notes/used.md"
+    with pytest.raises(ValueError, match="context record"):
+        store.save(SAMPLE, cited_sources=[path])
+    for invalid in ("../outside.md", "/absolute.md", "N1", 99):
+        with pytest.raises(ValueError):
+            store.save(record, cited_sources=[path, invalid])
+        assert store.by_update_key(record.update_key) is None
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be queued"):
+        store.save(record, cited_sources=[path], chunks=["private reply"])
+    assert store.recent(1) == []
+    id = store.save(record, cited_sources=[path])
+    assert store.save(record, cited_sources=["notes/replayed.md"]) == id
+    assert store.cited_paths(id) == [path]
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be queued"):
+        store.set_delivery(id, ["private reply"])
+    assert store.pending_deliveries() == []
+
+
+def test_forget_removes_context_private_and_their_citations(tmp_path, monkeypatch):
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    store = Store.open(tmp_path)
+    web_id = store.save(SAMPLE)
+    path = "notes/used.md"
+    context = store.save(replace(SAMPLE, kind="context"), cited_sources=[web_id, path])
+    private = store.save(replace(SAMPLE, kind="private"))
+    assert cli.main(["forget", str(web_id), "--yes"]) == 0
+    assert store.cited_sources(context) == [path]
+    assert cli.main(["forget", str(context), str(private), "--yes"]) == 0
+    assert store.get(context) is store.get(private) is None
+    assert store.cited_paths(context) == []
 
 
 @pytest.fixture

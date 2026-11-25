@@ -8,6 +8,7 @@ from threading import Barrier
 
 import pytest
 
+from core.recall import recall
 from tests.test_worklog_store import SAMPLE
 from worklog import Store
 from worklog.store import _MIGRATIONS, _SCHEMA_VERSION
@@ -95,6 +96,35 @@ def test_migrates_v1_and_preserves_worklog(v1_db):
     assert reopened.get(V1_RECORD.id) == V1_RECORD
     assert reopened.pending_deliveries() == []
     assert reopened.get_offset()[0] == 43
+
+
+@pytest.fixture
+def v5_db(v1_db):
+    with closing(sqlite3.connect(v1_db)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        for migration in _MIGRATIONS[1:5]:
+            for statement in migration:
+                db.execute(statement)
+        db.execute("CREATE VIRTUAL TABLE search_trigram USING fts5(question, body, tokenize='trigram')")
+        db.execute(
+            "INSERT INTO search_trigram(rowid, question, body) VALUES (?, ?, ?)",
+            (V1_RECORD.id, V1_RECORD.request, "\n".join(item.text for item in V1_RECORD.items)),
+        )
+        db.execute("UPDATE search_index SET tokenizer = 'trigram'")
+        db.execute("UPDATE schema_version SET version = 5")
+    return v1_db
+
+
+def test_migrates_v5_preserving_web_search_sources_and_cursor(v5_db):
+    store = Store.open(v5_db.parent)
+    assert_migrated(v5_db, store)
+    assert store.cited_paths(V1_RECORD.id) == []
+    status, matches = store.search("Summary")
+    assert status == "ok" and [hit.id for hit in matches] == [V1_RECORD.id]
+    recalled = recall(f"출처 {V1_RECORD.id}", store)
+    assert recalled.ref_id == V1_RECORD.id and recalled.items == V1_RECORD.items
+    store.mark_sent(V1_RECORD.id, len(V1_CHUNKS), offset=43)
+    assert store.get_offset()[0] == 43 and store.pending_deliveries() == []
 
 
 def test_migrates_v3_and_preserves_delivery_and_approval(v1_db):
