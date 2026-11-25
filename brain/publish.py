@@ -2,7 +2,7 @@
 
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +11,9 @@ from typing import Literal
 from uuid import uuid4
 
 from . import _is_link, _root
-from .policy import Rejected, check_write, relative_parts
+from .policy import (
+    MAX_POLICY_BYTES, Policy, Rejected, _allowed_directories, check_write, component_key, relative_parts,
+)
 
 _WINDOWS = os.name == "nt"
 _READ = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -43,9 +45,9 @@ class _Directory:
         return name if self.fd is not None else self.path / name
 
     def matching_names(self, name: str) -> list[str]:
-        folded = name.casefold()
+        folded = component_key(name)
         with os.scandir(self.fd if self.fd is not None else self.path) as entries:
-            return [entry.name for entry in entries if entry.name.casefold() == folded]
+            return [entry.name for entry in entries if component_key(entry.name) == folded]
 
 
 def _identity(info: os.stat_result) -> tuple[int, int]:
@@ -136,25 +138,45 @@ def _verify_file(
         raise OSError("vault file changed")
 
 
-def _read_policy(directory: _Directory) -> str | None:
+def _read_policy(directory: _Directory, names: list[str] | None = None) -> str | None:
     try:
-        names = directory.matching_names(_POLICY_NAME)
+        if names is None:
+            names = directory.matching_names(_POLICY_NAME)
         if not names:
             return None
         if names != [_POLICY_NAME]:
             raise Rejected("ambiguous BRAIN.md policy")
         entry = directory.entry(_POLICY_NAME)
         info = os.lstat(entry, dir_fd=directory.fd)
-        if _is_link(info) or not stat.S_ISREG(info.st_mode):
+        if _is_link(info) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise Rejected("unsafe BRAIN.md policy")
+        if info.st_size > MAX_POLICY_BYTES:
+            raise Rejected("BRAIN.md policy exceeds 64 KiB")
         fd = os.open(entry, _READ | getattr(os, "O_BINARY", 0), dir_fd=directory.fd)
-        with os.fdopen(fd, encoding="utf-8-sig") as source:
+        with os.fdopen(fd, "rb") as source:
             _verify_file(directory, _POLICY_NAME, directory.path, info, allow_hidden=True)
             if not os.path.samestat(info, os.fstat(source.fileno())):
                 raise Rejected("BRAIN.md policy changed")
-            return source.read()
+            data = source.read(MAX_POLICY_BYTES + 1)
+            after = os.fstat(fd)
+            if (
+                len(data) != info.st_size or after.st_size != info.st_size
+                or after.st_mtime_ns != info.st_mtime_ns or after.st_nlink != 1
+            ):
+                raise Rejected("BRAIN.md policy changed")
+            _verify_file(directory, _POLICY_NAME, directory.path, info, allow_hidden=True)
+            return data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, UnicodeError) as error:
         raise Rejected("cannot read or confirm absence of BRAIN.md") from error
+
+
+def search_policy(root: Path, entries: Iterable[os.DirEntry]) -> Policy | None:
+    """Use the complete, bounded root listing already obtained by search."""
+    names = [entry.name for entry in entries if component_key(entry.name) == _POLICY_NAME.casefold()]
+    if not names:
+        return None
+    with ExitStack() as stack:
+        return _allowed_directories(_read_policy(_open_root(stack, root), names))
 
 
 def _target_exists(directory: _Directory, name: str) -> bool:
@@ -252,6 +274,7 @@ def publish(
                 # Serialize case checks with publication for threads on case-sensitive filesystems.
                 with _publish_lock, ExitStack() as verify:
                     verified_root = _checked_root(verify, vault)
+                    check_write(parts, import_destination, _read_policy(verified_root))
                     parent = _target_directory(verify, verified_root, parts[:-1], create=False)
                     if not os.path.samestat(directory.info, parent.info):
                         raise Rejected("target directory changed")

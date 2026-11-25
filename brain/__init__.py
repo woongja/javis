@@ -14,6 +14,8 @@ from core.config import data_dir
 from harness import HarnessError
 from harness.paths import env_value, repo_root
 
+from .policy import Rejected, relative_parts
+
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SCAN_ENTRIES = 5000
 MAX_EXCERPT_CHARS = 400
@@ -126,7 +128,7 @@ def _read_markdown(path: Path, info: os.stat_result) -> str | None:
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     with open(path, "rb", opener=lambda name, _: os.open(name, flags)) as source:
         opened = os.fstat(source.fileno())
-        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(info, opened):
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or not os.path.samestat(info, opened):
             raise OSError("vault entry changed")
         if path.resolve(strict=True) != path:
             raise OSError("vault entry was redirected")
@@ -160,6 +162,8 @@ def _display(text: str) -> str:
 
 def search(query: str) -> SearchResult:
     """Rank all query terms within a title or a single paragraph."""
+    from .publish import _hidden, search_policy
+
     terms = query.casefold().split()
     if not terms:
         return SearchResult((), 0, False)
@@ -171,6 +175,7 @@ def search(query: str) -> SearchResult:
         nonlocal read_failures, omitted
         directories = [root]
         remaining = MAX_SCAN_ENTRIES
+        policy = None
         while directories:
             directory = directories.pop()
             if not remaining:
@@ -186,27 +191,41 @@ def search(query: str) -> SearchResult:
                 continue
             if len(batch) > remaining:
                 omitted = True
+                if directory == root:
+                    # An unseen policy or a second spelling could invalidate the entire search.
+                    return
                 batch.pop()
             remaining -= len(batch)
+            if directory == root:
+                try:
+                    policy = search_policy(root, batch)
+                except (OSError, RuntimeError, Rejected):
+                    read_failures += 1
+                    return
             children = []
             for entry in sorted(batch, key=lambda entry: entry.name):
-                if entry.name.startswith("."):
+                try:
+                    if relative_parts(entry.name) != (entry.name,):
+                        continue
+                except Rejected:
                     continue
                 path = directory / entry.name
+                relative = path.relative_to(root)
+                if policy is not None and policy.excludes(relative.parts):
+                    continue
                 try:
                     info = path.lstat()
-                    if _is_link(info):
+                    if _is_link(info) or _hidden(info):
                         continue
                     if stat.S_ISDIR(info.st_mode):
                         children.append(path)
-                    elif stat.S_ISREG(info.st_mode) and path.suffix.casefold() == ".md":
+                    elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and path.suffix.casefold() == ".md":
                         content = _read_markdown(path, info)
                         if content is None:
                             omitted = True
                             continue
-                        relative = path.relative_to(root).as_posix()
                         for priority, index, passage in _matching_passages(content, path.stem, terms):
-                            yield (priority, relative, index), passage
+                            yield (priority, relative.as_posix(), index), passage
                 except (OSError, RuntimeError, UnicodeError):
                     read_failures += 1
             directories.extend(reversed(children))

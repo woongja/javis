@@ -1,6 +1,7 @@
 import errno
 import os
 import stat
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -10,6 +11,8 @@ import pytest
 
 import brain.publish as publishing
 from brain.publish import pin_root, publish
+from core import cli
+from worklog import Store
 
 INBOX = "javis/inbox"
 NOTE = f"{INBOX}/Note.md"
@@ -125,7 +128,10 @@ def test_policy_can_only_narrow_approved_writes(vault):
     assert publish(vault, "imports/other/a.md", b"import", import_destination="imports").status == "rejected"
 
 
-@pytest.mark.parametrize("policy", [b"javis/inbox\n../elsewhere", b"\xff", b""])
+@pytest.mark.parametrize("policy", [
+    b"javis/inbox\n../elsewhere", b"\xff", b"", b"exclude: elsewhere",
+    pytest.param(b"javis/inbox\n".ljust(65537, b"\n"), id="oversize"),
+])
 def test_invalid_or_empty_policy_denies_notes_and_imports(vault, policy):
     (vault.path / "BRAIN.md").write_bytes(policy)
     assert publish(vault, NOTE, b"note").status == "rejected"
@@ -211,3 +217,43 @@ def test_published_inode_mismatch_leaves_target_alone(vault, monkeypatch):
     assert result.reason == "published file could not be verified"
     assert list((vault.path / INBOX).iterdir()) == [vault.path / NOTE]
     assert (vault.path / NOTE).read_bytes() == b"different file"
+
+
+def test_exclusion_overrides_grants_for_all_spellings(vault):
+    (vault.path / "BRAIN.md").write_text(
+        f"exclude: {INBOX}/보관\nexclude: {INBOX}/Private\n{INBOX}\n{INBOX}/보관/child",
+        encoding="utf-8",
+    )
+    for directory in ("보관", unicodedata.normalize("NFD", "보관"), "PRIVATE"):
+        assert publish(vault, f"{INBOX}/{directory}/child/a.md", b"note").status == "rejected"
+        assert not (vault.path / INBOX / directory).exists()
+    assert publish(vault, f"{INBOX}/보관함/a.md", b"note").status == "published"
+
+
+def test_policy_size_boundary_and_ambiguous_filename(vault):
+    policy = vault.path / "BRAIN.md"
+    policy.write_bytes(b"javis/inbox\n".ljust(65536, b"\n"))
+    assert publish(vault, NOTE, b"note").status == "published"
+    policy.rename(vault.path / "brain.MD")
+    assert publish(vault, f"{INBOX}/another.md", b"note").status == "rejected"
+
+
+@pytest.mark.parametrize("kind", ["note.create", "brain.import"])
+def test_approval_rechecks_excluded_destination(vault, monkeypatch, kind):
+    data = vault.path.parent / "data"
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault.path))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+    if kind == "brain.import":
+        source = vault.path.parent / "source"
+        source.mkdir()
+        (source / "a.md").write_bytes(b"note")
+        assert cli.main(["brain", "import", str(source), "--dest", INBOX]) == 0
+    else:
+        assert cli.main(["ask", "/note example"]) == 0
+    store = Store.open(data)
+    [draft] = store.list_approvals("pending")
+    assert draft.kind == kind
+    (vault.path / "BRAIN.md").write_text(f"{INBOX}\nexclude: {INBOX}", encoding="utf-8")
+    assert cli.main(["approve", draft.id]) == 1
+    assert store.get_approval(draft.id).status == "failed"
+    assert list((vault.path / INBOX).iterdir()) == []
