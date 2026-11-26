@@ -250,7 +250,11 @@ def _speak_answer(directory: Path, text: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    external = "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다."
+    external = (
+        "일반 질문은 관련 노트·기록과 함께 Claude로 전송되며, 맥락이 없으면 웹을 검색합니다. "
+        "/web <질문>은 질문만 웹 검색에 사용합니다. "
+        "/비공개 <질문>은 질문만 Anthropic에 보내며 검색과 본문 저장을 끕니다."
+    )
     parser = argparse.ArgumentParser(
         prog="javis", description="Ask javis, view the local worklog, and manage approvals.", epilog=external,
     )

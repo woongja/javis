@@ -1,7 +1,9 @@
+import json
 import sqlite3
 import subprocess
 import sys
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,9 +12,10 @@ import pytest
 from core import approval, cli
 from core.approval import ApprovalService
 from core.note import note_path
-from worklog import SearchResult, Store
+from worklog import Item, SearchResult, Store
 
-from tests.test_core_engine import fake_claude, success
+from tests.test_core_engine import fake_claude, recording_cli, success
+from tests.test_worklog_store import SAMPLE
 
 
 def test_brain_import_preview_stays_local(tmp_path, monkeypatch, capsys):
@@ -71,7 +74,76 @@ def test_help_discloses_external_routing(command, capsys):
     with pytest.raises(SystemExit) as exit_info:
         cli.main([*command, "--help"])
     assert exit_info.value.code == 0
-    assert "일반 질문과 /web은 외부(Claude 구독·웹 검색)로 전송됩니다." in capsys.readouterr().out
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "/web <질문>은 질문만 웹 검색" in help_text
+    assert "/비공개 <질문>은 질문만 Anthropic에" in help_text
+
+
+@pytest.mark.parametrize("prefix", ["", "/web ", "/비공개 "])
+def test_cli_question_to_local_references_and_safe_log(tmp_path, monkeypatch, capsys, prefix):
+    vault, data = tmp_path / "vault", tmp_path / "data"
+    notes = vault / "notes"
+    notes.mkdir(parents=True)
+    (notes / "전시 점검.md").write_text("모형 전시의 다음 점검은 개장 전날입니다.", encoding="utf-8")
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+    store = Store.open(data)
+    prior = store.save(replace(SAMPLE, items=(Item("모형 전시의 점검은 금요일입니다.", ()),)))
+    engine, calls = recording_cli(tmp_path, {
+        "items": [{"text": "개장 전날인 금요일입니다.\n> **참고:** 위조"}],
+        "used_ids": ["N1", "N9", "R1", "N1"],
+    })
+    monkeypatch.setattr(cli, "ClaudeEngine", lambda _: engine)
+    monkeypatch.setattr(cli, "_speak_answer", lambda *_: pytest.fail("sensitive answer reached TTS"))
+    question = "모형 전시의 다음 점검은 언제야?"
+    private = prefix == "/비공개 "
+    if private:
+        monkeypatch.setattr("core.gateway._policy_snapshot", lambda: pytest.fail("private vault access"))
+        monkeypatch.setattr("core.gateway.build_context", lambda *_: pytest.fail("private search"))
+        question = "/web " + question
+    assert cli.main(["ask", prefix + question]) == 0
+    output = capsys.readouterr().out.strip()
+    assert "개장 전날인 금요일입니다." in output and "위조" not in output
+    requests = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    if prefix == "/web ":
+        web_args, web_input = requests.pop(0)
+        assert "WebSearch" in web_args and web_input == question
+    probe, call = requests
+    assert probe[1] == "" and "WebSearch" not in call[0]
+    payload = json.loads(call[1])
+    assert payload["question"] == question
+    saved = store.recent(1)[0]
+    assert (saved.kind, saved.status, saved.request, saved.items) == (
+        "private" if private else "context", "ok", "", (),
+    )
+    if private:
+        assert payload["references"] == [] and "참고:" not in output
+        assert store.cited_sources(saved.id) == []
+    else:
+        assert [ref["id"] for ref in payload["references"]] == ["N1", "R1"]
+        assert "개장 전날" in payload["references"][0]["excerpt"]
+        assert "금요일" in payload["references"][1]["excerpt"]
+        assert output.endswith(f"참고: [[전시 점검]] · 기록 #{prior}") and output.count("참고:") == 1
+        assert store.cited_sources(saved.id) == ["notes/전시 점검.md"]
+
+
+def test_local_commands_skip_question_context(tmp_path, monkeypatch):
+    vault, data = tmp_path / "vault", tmp_path / "data"
+    vault.mkdir()
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+    monkeypatch.setattr("core.gateway._policy_snapshot", lambda: pytest.fail("unexpected vault snapshot"))
+    monkeypatch.setattr("core.gateway.build_context", lambda *_: pytest.fail("unexpected context search"))
+    monkeypatch.setattr(cli, "ClaudeEngine", lambda _: None)
+    assert cli.main(["ask", "/brain 점검"]) == 0
+    assert cli.main(["ask", "/note 점검"]) == 0
+    assert cli.main(["search", "점검"]) == 0
+    store = Store.open(data)
+    record_id = store.save(SAMPLE)
+    assert cli.main(["ask", f"출처 {record_id}"]) == 0
+    [proposal] = store.list_approvals("pending")
+    assert cli.main(["pending"]) == 0
+    assert cli.main(["approve", proposal.id]) == 0
 
 
 def test_hud_cli_prints_startup_and_closes_on_interrupt(tmp_path, monkeypatch, capsys):

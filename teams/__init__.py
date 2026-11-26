@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from core.engine import Engine, EngineResult
 
 
-ReplyKind = Literal["web", "local_only", "notice", "note"]
+ReplyKind = Literal["web", "context", "private", "local_only", "notice", "note"]
 
 
 @dataclass(frozen=True)
