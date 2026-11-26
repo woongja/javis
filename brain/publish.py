@@ -2,11 +2,10 @@
 
 import os
 import stat
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
@@ -18,7 +17,6 @@ from .policy import (
 _WINDOWS = os.name == "nt"
 _READ = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 _TEMP = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-_publish_lock = Lock()
 _POLICY_NAME = "BRAIN.md"
 
 
@@ -64,9 +62,35 @@ def _check_realpath(path: Path, root: Path) -> None:
         raise Rejected("vault path was redirected or aliased")
 
 
+def _hold_windows_directory(stack: ExitStack, path: Path, expected: os.stat_result) -> None:
+    """Keep a path component from being renamed or turned into a junction during publication."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    api.CreateFileW.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = (wintypes.HANDLE,)
+    # READ_ATTRIBUTES, share READ only, OPEN_EXISTING, BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+    handle = api.CreateFileW(str(path), 0x80, 1, None, 3, 0x02200000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        api.CloseHandle(handle)
+        raise
+    stack.callback(os.close, fd)
+    held = os.fstat(fd)
+    if _is_link(held) or not os.path.samestat(held, expected):
+        raise Rejected("vault directory changed")
+
+
 def _directory(
     stack: ExitStack, path: Path, parent: _Directory | None = None, *,
-    inside: bool = False, create: bool = False,
+    inside: bool = False, create: bool = False, hold: bool = False,
 ) -> _Directory:
     entry = parent.entry(path.name) if parent is not None else path
     dir_fd = parent.fd if parent is not None else None
@@ -83,6 +107,8 @@ def _directory(
     if _is_link(info) or not stat.S_ISDIR(info.st_mode) or (inside and _hidden(info)):
         raise Rejected("unsafe vault directory")
     if _WINDOWS:
+        if hold:
+            _hold_windows_directory(stack, path, info)
         if inside:
             _check_realpath(path, path.parent)
         return _Directory(path, info, None)
@@ -138,7 +164,7 @@ def _verify_file(
         raise OSError("vault file changed")
 
 
-def _read_policy(directory: _Directory, names: list[str] | None = None) -> str | None:
+def _policy_bytes(directory: _Directory, names: list[str] | None = None) -> bytes | None:
     try:
         if names is None:
             names = directory.matching_names(_POLICY_NAME)
@@ -165,9 +191,17 @@ def _read_policy(directory: _Directory, names: list[str] | None = None) -> str |
             ):
                 raise Rejected("BRAIN.md policy changed")
             _verify_file(directory, _POLICY_NAME, directory.path, info, allow_hidden=True)
-            return data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+            return data
     except (OSError, UnicodeError) as error:
         raise Rejected("cannot read or confirm absence of BRAIN.md") from error
+
+
+def _read_policy(directory: _Directory, names: list[str] | None = None) -> str | None:
+    raw = _policy_bytes(directory, names)
+    try:
+        return None if raw is None else raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeError as error:
+        raise Rejected("invalid BRAIN.md encoding") from error
 
 
 def search_policy(root: Path, entries: Iterable[os.DirEntry]) -> Policy | None:
@@ -197,19 +231,59 @@ def _target_exists(directory: _Directory, name: str) -> bool:
     return exists
 
 
-def _checked_root(stack: ExitStack, vault: VaultRoot) -> _Directory:
+def _checked_root(stack: ExitStack, vault: VaultRoot, *, hold: bool = False) -> _Directory:
     root = _open_root(stack, vault.path)
     if _identity(root.info) != (vault.device, vault.inode):
         raise Rejected("approved vault root changed")
+    if hold and _WINDOWS:
+        _hold_windows_directory(stack, root.path, root.info)
     return root
 
 
+@contextmanager
+def _vault_lock(root: _Directory) -> Iterator[None]:
+    """Serialize cooperating publishers across processes without a lock file in the vault."""
+    if root.fd is not None:
+        import fcntl
+
+        fcntl.flock(root.fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(root.fd, fcntl.LOCK_UN)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    api.CreateMutexW.restype = wintypes.HANDLE
+    api.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    api.WaitForSingleObject.restype = wintypes.DWORD
+    api.ReleaseMutex.argtypes = api.CloseHandle.argtypes = (wintypes.HANDLE,)
+    dev, ino = _identity(root.info)
+    handle = api.CreateMutexW(None, False, f"Global\\javis-vault-{dev:x}-{ino:x}")
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # An abandoned mutex also grants ownership after a publisher exits.
+        if api.WaitForSingleObject(handle, 0xFFFFFFFF) not in (0, 0x80):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield
+        finally:
+            api.ReleaseMutex(handle)
+    finally:
+        api.CloseHandle(handle)
+
+
 def _target_directory(
-    stack: ExitStack, root: _Directory, parts: tuple[str, ...], *, create: bool,
+    stack: ExitStack, root: _Directory, parts: tuple[str, ...], *, create: bool, hold: bool = False,
 ) -> _Directory:
     directory = root
     for part in parts:
-        directory = _directory(stack, directory.path / part, directory, inside=True, create=create)
+        directory = _directory(stack, directory.path / part, directory, inside=True, create=create, hold=hold)
     return directory
 
 
@@ -261,27 +335,37 @@ def publish(
 
     Import callers must supply the directory the user approved for this request.
     """
+    def check(parts: tuple[str, ...], root: _Directory) -> None:
+        check_write(parts, import_destination, _read_policy(root))
+
+    return _publish_new(vault, relative_path, content, check)
+
+
+def _publish_new(
+    vault: VaultRoot, relative_path: str, content: bytes,
+    check: Callable[[tuple[str, ...], _Directory], None],
+) -> PublishResult:
     try:
         parts = relative_parts(relative_path)
         name = parts[-1]
         with ExitStack() as stack:
             root = _checked_root(stack, vault)
-            check_write(parts, import_destination, _read_policy(root))
-            directory = _target_directory(stack, root, parts[:-1], create=True)
+            stack.enter_context(_vault_lock(root))
+            root = _checked_root(stack, vault, hold=True)
+            check(parts, root)
+            directory = _target_directory(stack, root, parts[:-1], create=True, hold=True)
             if _target_exists(directory, name):
                 return PublishResult("conflict")
             with _completed_temp(directory, vault.path, content) as (temporary, info):
-                # Serialize case checks with publication for threads on case-sensitive filesystems.
-                with _publish_lock, ExitStack() as verify:
+                with ExitStack() as verify:
                     verified_root = _checked_root(verify, vault)
-                    check_write(parts, import_destination, _read_policy(verified_root))
+                    check(parts, verified_root)
                     parent = _target_directory(verify, verified_root, parts[:-1], create=False)
                     if not os.path.samestat(directory.info, parent.info):
                         raise Rejected("target directory changed")
                     if _target_exists(parent, name):
                         return PublishResult("conflict")
                     _verify_file(parent, temporary, vault.path, info, allow_hidden=True)
-                    # Windows path checks and rename leave a short directory-swap window.
                     try:
                         _publish(parent, temporary, name)
                     except FileExistsError:
@@ -290,6 +374,8 @@ def publish(
                     _verify_file(directory, name, vault.path, info)
                 except OSError:
                     return PublishResult("failed", "published file could not be verified")
+    except FileExistsError:
+        return PublishResult("conflict")
     except Rejected as error:
         return PublishResult("rejected", str(error))
     except (OSError, UnicodeError):

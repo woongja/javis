@@ -1,21 +1,24 @@
-"""Atomic wiki notes and the read-only vault snapshot used to plan changes."""
+"""Plan and execute approved atomic wiki file changes."""
 
 import hashlib
 import json
 import os
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import MappingProxyType
 
-from . import MAX_FILE_BYTES, _VaultScan
+from . import MAX_FILE_BYTES, _VaultScan, _is_link
 from .context import _metadata
 from .importer import _source_bytes
-from .policy import MAX_POLICY_BYTES, Policy, Rejected, _allowed_directories, component_key, relative_parts
-from .publish import VaultRoot, _checked_root, _target_directory
+from .policy import Policy, Rejected, _allowed_directories, _check_policy, component_key, relative_parts
+from .publish import (
+    VaultRoot, _checked_root, _directory, _identity, _policy_bytes, _publish_new, _read_policy,
+    _target_directory, _vault_lock, pin_configured_root,
+)
 
 NOTES = "javis/wiki/notes/"
 TOPICS = "javis/wiki/topics/"
@@ -184,6 +187,13 @@ class Catalog:
 
 def read_catalog(vault: VaultRoot, selected: set[str]) -> Catalog:
     """Inventory allowed names, opening only the policy and explicitly selected files."""
+    with ExitStack() as stack:
+        root = _checked_root(stack, vault)
+        with _vault_lock(root):
+            return _catalog(vault, selected)
+
+
+def _catalog(vault: VaultRoot, selected: set[str], *, allow_missing: bool = False) -> Catalog:
     if len(selected) > 6:
         raise Rejected("select at most six reference files")
     scan = _VaultScan()
@@ -195,26 +205,244 @@ def read_catalog(vault: VaultRoot, selected: set[str]) -> Catalog:
             name = path.as_posix()
             paths.append(name)
             if name in selected:
-                if info.st_size > MAX_FILE_BYTES:
-                    raise Rejected("selected note exceeds the read limit")
-                with ExitStack() as parents:
-                    parent = _target_directory(parents, root, path.parts[:-1], create=False)
-                    data = _source_bytes(parent, path.name, vault.path, info)
-                files[name] = FileSnapshot(data, (info.st_dev, info.st_ino))
-        if scan.read_failures or files.keys() != selected:
+                try:
+                    if info.st_size > MAX_FILE_BYTES:
+                        raise Rejected("selected note exceeds the read limit")
+                    with ExitStack() as parents:
+                        parent = _target_directory(parents, root, path.parts[:-1], create=False)
+                        data = _source_bytes(parent, path.name, vault.path, info)
+                    files[name] = FileSnapshot(data, _identity(info))
+                except (OSError, ValueError):
+                    if not allow_missing:
+                        raise
+        if scan.read_failures or (not allow_missing and files.keys() != selected):
             raise Rejected("cannot confirm selected files")
         keys = [component_key(name) for name in paths]
-        if any(keys.count(component_key(name)) != 1 for name in selected):
-            raise Rejected("ambiguous selected file")
+        for name in selected:
+            if keys.count(component_key(name)) > 1:
+                if not allow_missing:
+                    raise Rejected("ambiguous selected file")
+                files.pop(name, None)
         policy_hash = "absent"
-        if scan.policy is not None:
-            info = os.lstat(root.entry("BRAIN.md"), dir_fd=root.fd)
-            if info.st_size > MAX_POLICY_BYTES or info.st_nlink != 1:
-                raise Rejected("invalid BRAIN.md")
-            raw = _source_bytes(root, "BRAIN.md", vault.path, info)
+        raw = _policy_bytes(root)
+        policy = None
+        if raw is not None:
             policy = _allowed_directories(raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n"))
-            if policy != scan.policy:
-                raise Rejected("BRAIN.md changed")
             policy_hash = hashlib.sha256(raw).hexdigest()
+        if policy != scan.policy:
+            raise Rejected("BRAIN.md changed")
     return Catalog((vault.device, vault.inode), scan.policy, policy_hash, tuple(paths),
                    not scan.omitted, MappingProxyType(files))
+
+
+def _wiki_parts(path: str) -> tuple[str, ...]:
+    parts = relative_parts(path)
+    if ("/".join(parts) != path or not path.endswith(".md")
+            or not (path == "javis/wiki/index.md"
+                    or len(parts) == 4 and parts[:3] in (("javis", "wiki", "notes"), ("javis", "wiki", "topics")))):
+        raise Rejected("invalid wiki destination")
+    title = parts[-1][:-3]
+    if validated_title(title) != title:
+        raise Rejected("wiki destination must be NFC")
+    return parts
+
+
+def _source_paths(sources: dict) -> set[str]:
+    paths = set()
+    for pin in sources.values():
+        if "path" in pin:
+            path = pin["path"]
+            parts = relative_parts(path)
+            if ("/".join(parts) != path or not path.casefold().endswith(".md")
+                    or not (parts[0] == "me" or path.startswith(NOTES) and len(parts) == 4)
+                    or not re.fullmatch("[0-9a-f]{64}", pin["sha256"])):
+                raise Rejected("invalid source pin")
+            start, end = pin["byte_range"]
+            if type(start) != int or type(end) != int or not 0 <= start < end <= MAX_FILE_BYTES:
+                raise Rejected("invalid source range")
+            paths.add(path)
+        elif "record_id" in pin:
+            if type(pin["record_id"]) != int or pin["record_id"] < 1:
+                raise Rejected("invalid source record")
+        elif pin.get("type") != "conversation" or not isinstance(pin.get("text"), str):
+            raise Rejected("invalid conversation source")
+    return paths
+
+
+def _validate_ops(spec: dict, catalog: Catalog) -> None:
+    if spec["root_id"] != list(catalog.root_id) or spec["policy_hash"] != catalog.policy_hash:
+        raise Rejected("approved vault or policy changed")
+    if not catalog.complete:
+        raise Rejected("incomplete name inventory")
+    targets = {note_link(op["path"]): op for op in spec["ops"]}
+    earlier = set()
+    names = set()
+    phase = 0
+    for op in spec["ops"]:
+        path = op["path"]
+        parts = _wiki_parts(path)
+        _check_policy(parts, catalog.policy)
+        stage = 0 if path.startswith(NOTES) else 1 if path.startswith(TOPICS) else 2
+        dependencies = set(op["depends_on"])
+        if stage < phase or not dependencies <= earlier:
+            raise Rejected("invalid wiki dependency order")
+        phase = stage
+        earlier.add(op["id"])
+        content = op["content"].encode()
+        if not content or len(content) > (MAX_NOTE_BYTES if stage == 0 else 32 * 1024):
+            raise Rejected("invalid operation size")
+        if not set(op.get("sources", [])) <= spec["sources"].keys():
+            raise Rejected("unknown source")
+        for link in re.findall(r"\[\[[^\[\]\r\n]+\]\]", op["content"]):
+            target = targets.get(link)
+            if target and (target["kind"] == "create" or stage > 0) and target["id"] not in dependencies:
+                raise Rejected("missing file dependency")
+        if op["kind"] == "append":
+            continue  # The approval store validated the append preconditions. No adapter yet.
+        if op["kind"] != "create" or op.get("absent") is not True:
+            raise Rejected("invalid create operation")
+        if hashlib.sha256(content).hexdigest() != op["result_sha256"]:
+            raise Rejected("invalid result hash")
+        key = component_key(parts[-1])
+        if key in names:
+            raise Rejected("duplicate approved name")
+        names.add(key)
+        if stage == 0:
+            parse_note(content, title=parts[-1][:-3], policy=catalog.policy)
+
+
+def _file_pins(op: dict, sources: dict) -> dict:
+    """Proposal pins also cover existing relation and split targets referenced in the bytes."""
+    return {key: pin for key, pin in sources.items() if (path := pin.get("path")) is not None
+            and (key in op.get("sources", []) or path == op["path"] or note_link(path) in op["content"])}
+
+
+def _check_sources(pins: dict, catalog: Catalog, approved: Catalog) -> None:
+    for pin in pins.values():
+        path = pin["path"]
+        file = catalog.selected.get(path)
+        if (file is None or file.identity != approved.selected[path].identity
+                or pin["byte_range"][1] > len(file.content)
+                or hashlib.sha256(file.content).hexdigest() != pin["sha256"]):
+            raise Rejected("approved source changed")
+
+
+def _parent_ids(root, parts: tuple[str, ...]) -> tuple:
+    ids = []
+    with ExitStack() as stack:
+        parent = root
+        for part in parts[:-1]:
+            matches = parent.matching_names(part)
+            if matches and matches != [part]:
+                raise Rejected("ambiguous parent")
+            try:
+                parent = _directory(stack, parent.path / part, parent, inside=True)
+            except FileNotFoundError:
+                break
+            ids.append(_identity(parent.info))
+    return tuple(ids)
+
+
+def _target_snapshot(vault: VaultRoot, path: str) -> FileSnapshot | None:
+    parts = _wiki_parts(path)
+    with ExitStack() as stack:
+        root = _checked_root(stack, vault)
+        _check_policy(parts, _allowed_directories(_read_policy(root)))
+        if len(_parent_ids(root, parts)) < len(parts) - 1:
+            return None
+        parent = _target_directory(stack, root, parts[:-1], create=False)
+        matches = parent.matching_names(parts[-1])
+        try:
+            info = os.lstat(parent.entry(parts[-1]), dir_fd=parent.fd)
+        except FileNotFoundError:
+            if matches:
+                raise Rejected("target spelling changed")
+            return None
+        if (matches != [parts[-1]] or info.st_nlink != 1 or _is_link(info)
+                or info.st_size > 32 * 1024):
+            raise Rejected("cannot verify wiki target")
+        data = _source_bytes(parent, parts[-1], vault.path, info)
+        return FileSnapshot(data, _identity(info))
+
+
+def _create(vault, op, pins, approved, parents):
+    def check(parts, root):
+        current = _catalog(vault, {pin["path"] for pin in pins.values()})
+        if not current.complete or current.policy_hash != approved.policy_hash:
+            raise Rejected("wiki policy or inventory changed")
+        _check_policy(parts, current.policy)
+        if _parent_ids(root, parts)[:len(parents)] != parents:
+            raise Rejected("wiki parent changed")
+        _check_sources(pins, current, approved)
+        if component_key(parts[-1][:-3]) in Names(current.paths, True).used:
+            raise FileExistsError
+
+    result = _publish_new(vault, op["path"], op["content"].encode(), check)
+    if result.status == "conflict":
+        return "conflict"
+    if result.status != "published":
+        return "failed"
+    file = _target_snapshot(vault, op["path"])
+    return "done" if file and hashlib.sha256(file.content).hexdigest() == op["result_sha256"] else "failed"
+
+
+def execute_creates(spec: dict) -> Iterator[tuple[str, str]]:
+    """Yield each file outcome so the claim holder can commit it before the next write."""
+    ops = spec["ops"]
+    invalid = set()
+    parents = {}
+    pins = {}
+    try:
+        vault = pin_configured_root()
+        if list((vault.device, vault.inode)) != spec["root_id"]:
+            raise Rejected("approved vault changed")
+        paths = _source_paths(spec["sources"])
+        with ExitStack() as stack:
+            root = _checked_root(stack, vault)
+            stack.enter_context(_vault_lock(root))
+            approved = _catalog(vault, paths, allow_missing=True)
+            _validate_ops(spec, approved)
+            for op in ops:
+                key = op["id"]
+                pins[key] = _file_pins(op, spec["sources"])
+                try:
+                    _check_sources(pins[key], approved, approved)
+                    parents[key] = _parent_ids(root, _wiki_parts(op["path"]))
+                except (OSError, ValueError):
+                    invalid.add(key)
+            # Deduplicated relations can leave an approved pin with no link in the added bytes.
+            used = set().union(*pins.values())
+            other = {key: pin for key, pin in spec["sources"].items() if "path" in pin and key not in used}
+            _check_sources(other, approved, approved)
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        invalid.update(op["id"] for op in ops)
+
+    done = set()
+    for op in ops:
+        key = op["id"]
+        if not done.issuperset(op["depends_on"]):
+            status = "dependency_incomplete"
+        elif key in invalid or op["kind"] == "append":
+            status = "failed"
+        else:
+            try:
+                status = _create(vault, op, pins[key], approved, parents[key])
+            except (OSError, ValueError):
+                status = "failed"
+        if status == "done":
+            done.add(key)
+        yield key, status
+
+
+def reconcile_file(vault: VaultRoot, op: dict, base: str | None, result: str) -> str:
+    """Compare only the approved target. Recovery never invokes a publisher."""
+    try:
+        file = _target_snapshot(vault, op["path"])
+        digest = hashlib.sha256(file.content).hexdigest() if file else None
+        if digest == result:
+            return "done"
+        if digest == base and (file is None or list(file.identity) == op.get("file_id")):
+            return "unapplied"
+    except (OSError, ValueError):
+        pass
+    return "unknown"
