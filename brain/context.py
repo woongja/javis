@@ -2,7 +2,7 @@
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
@@ -245,6 +245,27 @@ def _excerpt(text: str, targets: dict[str, str]) -> str:
     return " ".join(_LINK.sub(label, text).split())
 
 
+def _title_excerpt(
+    body: str, heading: re.Match[str] | None, targets: dict[str, str], count: Callable[[str], int],
+) -> str:
+    lines = [line.strip() for line in _prose_lines(body)]
+    start = body.count("\n", 0, heading.end()) + 1 if heading else 0
+    body_lines = lines[start:]
+    first = next((line for line in body_lines if line), "")
+    summary = [] if first.startswith(("#", "- 사실:", "- 관계:")) else [_excerpt(first, targets)]
+    facts = [_excerpt(line, targets) for line in body_lines if line.startswith("- 사실:")]
+    prose = "\n".join("" if line.startswith(("#", "- 관계:")) else line for line in lines)
+    paragraphs = (
+        [_excerpt(line, targets) for line in paragraph.splitlines()]
+        for paragraph in _PARAGRAPHS.split(prose)
+    )
+    # Put the best matching prose paragraph first, breaking ties by note order,
+    # so the byte limit favors it when only one excerpt per note is selected.
+    best = max(paragraphs, key=lambda paragraph: count(" ".join(paragraph)))
+    matched = best if count(" ".join(best)) else []
+    return "\n".join(dict.fromkeys(line for line in (*matched, *summary, *facts) if line))
+
+
 def _first_fact(path: str, body: str, targets: dict[str, str]) -> Candidate | None:
     prose = _HEADING.sub("", "\n".join(_prose_lines(body)), count=1)
     first = None
@@ -281,11 +302,13 @@ def context_candidates(question: str) -> list[Candidate]:
         if heading:
             label = _excerpt(re.sub(r"(?<=[ \t])#+$", "", heading[1].rstrip()), targets)
             title = max((label, filename), key=count)
-            body = body[:heading.start()] + "\n" + body[heading.end():]
         matches = count(title)
         if matches:
-            titles.append(Candidate("title", path, title, matches, 0))
+            excerpt = _title_excerpt(body, heading, targets, count) or title
+            titles.append(Candidate("title", path, excerpt, matches, 0))
             parents[path] = (-matches, 0, path)
+        if heading:
+            body = body[:heading.start()] + "\n" + body[heading.end():]
         for index, paragraph in enumerate(_PARAGRAPHS.split(body)):
             excerpt = _excerpt(paragraph, targets)
             if not excerpt:

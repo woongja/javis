@@ -6,6 +6,7 @@ import pytest
 import brain
 from brain.context import Candidate
 from core.context import build_context
+from tests.test_brain_context import _ATOMIC, _EMPTY_SOURCES, _EXAMPLE
 from tests.test_worklog_store import SAMPLE
 from worklog import Item, Store
 from worklog import search
@@ -24,7 +25,7 @@ def local(tmp_path, monkeypatch):
 def test_reserves_both_sources_and_fills_by_rank(local):
     vault, store = local
     for name in "gfedcba":
-        (vault / f"{name}.md").write_text(f"# 빛 색 {name}\n\n빛 색 다른 문단", encoding="utf-8")
+        (vault / f"{name}.md").write_text(f"# 빛 색 {name}\n\n빛 색 다른 문단 {name}", encoding="utf-8")
     record_id = store.save(replace(SAMPLE, request="빛", items=(Item("측정했다. 빛 확인.", ()),)))
     question = "빛, 색? 알려줘"
     result = build_context(question, store)
@@ -32,11 +33,46 @@ def test_reserves_both_sources_and_fills_by_rank(local):
     payload = json.loads(result.payload)
     assert payload["question"] == question
     assert payload["references"][:2] == [
-        {"id": "N1", "type": "note", "excerpt": "빛 색 a"},
+        {"id": "N1", "type": "note", "excerpt": "빛 색 다른 문단 a"},
         {"id": "R1", "type": "record", "excerpt": "빛 확인."},
     ]
     assert list(result.sources) == [r["id"] for r in payload["references"]]
     assert ".md" not in result.payload
+
+
+def test_title_hit_serializes_the_example_note_body(local):
+    vault, store = local
+    notes = vault / "javis/wiki/notes"
+    notes.mkdir(parents=True)
+    (notes / "전시 점검.md").write_text(_ATOMIC + _EXAMPLE, encoding="utf-8")
+    (notes / "전시 조명.md").write_text(_EMPTY_SOURCES + "# 전시 조명\n- 사실: 조명을 사용한다.", encoding="utf-8")
+    (notes / "전시 준비.md").write_text(_EMPTY_SOURCES + "# 전시 준비\n- 사실: 모형을 준비한다.", encoding="utf-8")
+    (vault / "me").mkdir()
+    (vault / "me/모형 전시.md").write_text("모형을 전시한다.", encoding="utf-8")
+
+    result = build_context("전시 점검은 언제 해?", store)
+    excerpts = [ref["excerpt"] for ref in json.loads(result.payload)["references"]
+                if result.sources[ref["id"]] == "javis/wiki/notes/전시 점검.md"]
+    assert excerpts == ["모형 전시를 열기 전에 조명을 점검한다.\n"
+                        "- 사실: 조명 점검은 개장 전날에 한다.\n- 사실: 점검 장소는 모형실이다."]
+
+
+def test_title_hit_prioritizes_a_late_matching_fact_and_clips_at_a_utf8_boundary(local):
+    vault, store = local
+    fact = "- 사실: " + "가" * 200
+    facts = [fact, fact.replace("가", "나")]
+    match = "- 사실: 점검은 개장 전날에 한다."
+    summary = "운영 일정"
+    (vault / "점검.md").write_text("\n".join(["# 점검", summary, *facts, match]), encoding="utf-8")
+
+    result = build_context("점검 언제?", store)
+    assert result.sources == {"N1": "점검.md"}
+    excerpt = json.loads(result.payload)["references"][0]["excerpt"]
+    full = "\n".join([match, summary, *facts]).encode("utf-8")
+    assert len(full) > 1024
+    with pytest.raises(UnicodeDecodeError):
+        full[:1024].decode("utf-8")
+    assert excerpt == full[:1024].decode("utf-8", errors="ignore")
 
 
 @pytest.mark.parametrize("term", ["AI", "É"])

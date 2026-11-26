@@ -98,7 +98,7 @@ def test_terms_counts_positions_and_order(vault, monkeypatch):
     vault("c.md", "one fact\n\nanother fact\n- 관계: [[a]]")
     found = brain.context_candidates("ROAD/rain")
     assert [(c.kind, c.excerpt, c.matched_terms) for c in found] == [
-        ("title", "rain", 1), ("title", "Road", 1), ("paragraph", "road", 1),
+        ("title", "road", 1), ("title", "rain on ROAD\nrain rain", 1), ("paragraph", "road", 1),
         ("paragraph", "rain rain", 1), ("paragraph", "rain on ROAD", 2), ("neighbor", "one fact", 0),
     ]
     assert found[3].paragraph < found[4].paragraph
@@ -144,7 +144,9 @@ def test_prunes_exclusions_and_navigation_and_redacts_links(vault, monkeypatch):
 
     monkeypatch.setattr(brain.os, "scandir", checked)
     found = brain.context_candidates("key")
-    assert [(c.relative_path, c.excerpt) for c in found] == [("key.md", "key"), ("key.md", "key safe")]
+    assert [(c.kind, c.relative_path, c.excerpt) for c in found] == [
+        ("title", "key.md", "key safe"), ("paragraph", "key.md", "key safe"),
+    ]
 
 
 @pytest.mark.parametrize("header", [
