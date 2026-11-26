@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -8,9 +9,12 @@ from threading import Barrier
 
 import pytest
 
+from brain.curate import Catalog, FileSnapshot
 from core import approval
 from core.approval import ApprovalService
-from worklog import Decision, Store
+from core.curate import build_prompt, build_proposal
+from tests.test_curate_proposal import EXAMPLE, EXISTING, append, create
+from worklog import CurateFileResult, Decision, Store
 
 
 NOW = datetime(2026, 11, 22, 12, tzinfo=UTC)
@@ -20,6 +24,136 @@ DEADLINE = NOW + timedelta(hours=24)
 @pytest.fixture
 def service(tmp_path):
     return ApprovalService(Store.open(tmp_path))
+
+
+@pytest.fixture
+def curate_payload(monkeypatch):
+    monkeypatch.setattr(approval, "os_user", lambda: "owner")
+    snapshot = FileSnapshot(EXAMPLE, (1, 3))
+    catalog = Catalog((1, 2), None, "absent", (EXISTING,), True, {EXISTING: snapshot})
+    start = EXAMPLE.index(b"- ", EXAMPLE.index(b"# "))
+    prompt = build_prompt("new input", catalog, ranges=((EXISTING, start, EXAMPLE.index(b"\n", start)),))
+    return build_proposal(prompt, {"ops": [create(), append(id="P2")]}).payload
+
+
+def test_curate_requires_pc_owner_and_hides_guessed_ids(tmp_path, service, curate_payload):
+    store = Store.open(tmp_path)
+    for actor, channel in [("other", "cli"), ("owner", "telegram")]:
+        with pytest.raises(ValueError):
+            service.propose("brain.curate", curate_payload, actor, channel, NOW)
+    proposal = service.propose("brain.curate", curate_payload, "owner", "cli", NOW)
+    assert store.telegram_pending_notes("owner", NOW) == []
+    for approve in (True, False):
+        guessed = service.decide(proposal.id, "owner", "telegram", approve, NOW)
+        assert guessed == service.decide("missing", "owner", "telegram", approve, NOW) == Decision("not_found")
+        assert service.decide(proposal.id, "other", "cli", approve, NOW) == Decision("forbidden")
+    assert store.get_approval(proposal.id) == proposal
+
+
+def test_curate_rejects_invalid_file_plan_before_storing(tmp_path, service, curate_payload):
+    spec = json.loads(curate_payload)
+    create_op, append_op = spec["ops"]
+    invalid_ops = [
+        [create_op, create_op],
+        [create_op | {"depends_on": ["P2"]}, append_op],
+        [append_op | {"base_sha256": None}],
+        [create_op | {"result_sha256": "bad"}],
+        [create_op | {"path": f"{i}.md", "id": f"P{i}"} for i in range(1, 18)],
+    ]
+    invalid_payloads = [spec, curate_payload + " " * 65536]
+    invalid_payloads.extend(json.dumps(spec | {"ops": ops}) for ops in invalid_ops)
+    for payload in invalid_payloads:
+        with pytest.raises(ValueError):
+            service.propose("brain.curate", payload, "owner", "cli", NOW)
+    assert Store.open(tmp_path).list_approvals("pending", now=NOW) == []
+
+
+@pytest.mark.parametrize("approve", [True, False])
+def test_curate_tamper_blocks_decision(tmp_path, service, curate_payload, approve):
+    store = Store.open(tmp_path)
+    proposal = service.propose("brain.curate", curate_payload, "owner", "cli", NOW)
+    with store._connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute("UPDATE approvals SET payload_hash = 'wrong' WHERE id = ?", (proposal.id,))
+        db.execute("DROP TRIGGER approvals_immutable_payload")
+        db.execute("UPDATE approvals SET payload = payload || ' ' WHERE id = ?", (proposal.id,))
+    assert service.decide(proposal.id, "owner", "cli", approve, NOW) == Decision("forbidden")
+    assert store.get_approval(proposal.id).status == "pending"
+    assert all(f.status is None for f in store.curate_file_results(proposal.id))
+
+
+@pytest.mark.parametrize("action", ["approve", "reject", "list"])
+def test_curate_rejection_and_expiry_clear_private_data(tmp_path, service, curate_payload, action):
+    store = Store.open(tmp_path)
+    proposal = service.propose("brain.curate", curate_payload, "owner", "cli", NOW)
+    assert datetime.fromisoformat(proposal.expires_at) == DEADLINE
+    if action == "list":
+        assert store.list_approvals("pending", now=DEADLINE) == []
+    elif action == "reject":
+        assert service.decide(proposal.id, "owner", "cli", False, NOW) == Decision("rejected")
+    else:
+        assert service.decide(proposal.id, "owner", "cli", True, DEADLINE) == Decision("expired")
+    row = store.get_approval(proposal.id)
+    assert row.status == ("rejected" if action == "reject" else "expired")
+    assert row.payload is row.payload_hash is None and store.curate_file_results(row.id) == []
+    assert service.decide(row.id, "owner", "cli", True, DEADLINE).approval is None
+
+
+def test_curate_concurrent_claim_dispatches_exact_payload_once(tmp_path, service, curate_payload):
+    payload = " " + curate_payload + "\n"
+    proposal = service.propose("brain.curate", payload, "owner", "cli", NOW)
+    assert proposal.payload_hash == hashlib.sha256(payload.encode()).hexdigest()
+    executed = []
+    barrier = Barrier(2, timeout=10)
+
+    def decide(_):
+        store = Store.open(tmp_path)
+
+        def executor(claim):
+            assert store.get_approval(claim.id) == claim
+            executed.append(claim.payload)
+            return True
+
+        worker = ApprovalService(store, {"brain.curate": executor})
+        barrier.wait()
+        result = worker.decide(proposal.id, "owner", "cli", True, DEADLINE - timedelta(microseconds=1))
+        if result.approval:
+            worker.execute(result.approval)
+        return result.status
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        assert sorted(workers.map(decide, range(2))) == ["already_decided", "claimed"]
+    assert executed == [payload]
+
+
+@pytest.mark.parametrize("outcome", ["done", "conflict", "failed", "dependency_incomplete", "unknown"])
+def test_curate_file_journal_and_batch_verdict(tmp_path, service, curate_payload, outcome):
+    store = Store.open(tmp_path)
+    id = service.propose("brain.curate", curate_payload, "owner", "cli", NOW).id
+    assert not service.record_curate_result(id, "P1", "done")
+    claim = service.decide(id, "owner", "cli", True, NOW).approval
+    create_op, append_op = json.loads(claim.payload)["ops"]
+    assert store.curate_file_results(id) == [
+        CurateFileResult("P1", None, create_op["result_sha256"]),
+        CurateFileResult("P2", append_op["base_sha256"], append_op["result_sha256"]),
+    ]
+    assert not store.record_curate_result(id, "P1", "failed", executor=(claim.executor_pid, "wrong"))
+    assert not service.record_curate_result(id, "P3", "failed")
+    assert service.record_curate_result(id, "P1", "done")
+    assert not service.record_curate_result(id, "P1", "failed")
+    assert not service.finish(id, True)
+    assert Store.open(tmp_path).curate_file_results(id)[0].status == "done"
+    assert service.record_curate_result(id, "P2", outcome)
+    assert service.finish(id, outcome != "done")  # The persisted file outcomes determine the verdict.
+    final = store.get_approval(id)
+    assert final.status == ("done" if outcome == "done" else "failed")
+    assert final.payload is final.payload_hash is None
+    assert store.curate_file_results(id) == [
+        CurateFileResult("P1", None, None, "done"), CurateFileResult("P2", None, None, outcome),
+    ]
+    assert store.curate_result_counts(id) == ({"done": 2} if outcome == "done" else {"done": 1, outcome: 1})
+    assert not service.record_curate_result(id, "P2", "done")
+    assert service.decide(id, "owner", "cli", True, NOW) == Decision("already_decided")
 
 
 @pytest.mark.parametrize(("kind", "payload"), [

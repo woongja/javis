@@ -127,6 +127,40 @@ def test_migrates_v5_preserving_web_search_sources_and_cursor(v5_db):
     assert store.get_offset()[0] == 43 and store.pending_deliveries() == []
 
 
+def test_migrates_v7_live_approvals_and_partial_reply(v5_db):
+    with closing(sqlite3.connect(v5_db)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        for migration in _MIGRATIONS[5:7]:
+            for statement in migration:
+                db.execute(statement)
+        db.execute("UPDATE schema_version SET version = 7")
+    old = Store(v5_db)
+    now = datetime.fromisoformat(V1_RECORD.created_at)
+    pending = old.create_telegram_note_proposal(
+        owner="chat", message_id=17, update_key="43:101", now=now, payload="draft",
+        delivery=lambda *_: ["first", "second"],
+    )
+    old.mark_sent(old.by_update_key("43:101").id, 1)
+    deliveries = old.pending_deliveries()
+    importing = old.create_approval(
+        kind="brain.import", owner="owner", allowed_channel="cli", created_at=pending.created_at,
+        expires_at=pending.expires_at, payload='{"files":[]}',
+    )
+    executing = old.decide_approval(
+        importing.id, actor="owner", channel="cli", approve=True, now=now, executor=(42, "start"),
+    ).approval
+
+    store = Store.open(v5_db.parent)
+    assert store.get_approval(pending.id) == pending
+    assert store.get_approval(importing.id) == executing
+    assert store.telegram_pending_notes("chat", now) == [(17, pending.expires_at, pending.id)]
+    assert store.pending_deliveries() == deliveries
+    assert store.get_offset() == V1_CURSOR
+    assert store.finish_approval(importing.id, ok=True, executor=(42, "start"))
+    with store._connect() as db:
+        assert not db.execute("PRAGMA foreign_key_check").fetchall()
+
+
 def test_migrates_v3_and_preserves_delivery_and_approval(v1_db):
     with closing(sqlite3.connect(v1_db)) as db, db:
         db.execute("PRAGMA foreign_keys = ON")

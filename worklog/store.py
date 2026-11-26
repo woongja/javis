@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -41,7 +42,8 @@ class Record:
     update_key: str | None
 
 
-ApprovalKind = Literal["note.create", "brain.import"]
+ApprovalKind = Literal["note.create", "brain.import", "brain.curate"]
+CurateFileStatus = Literal["done", "conflict", "failed", "dependency_incomplete", "unknown"]
 ApprovalStatus = Literal["pending", "executing", "done", "failed", "rejected", "expired"]
 DecisionStatus = Literal[
     "claimed", "rejected", "expired", "not_found", "forbidden", "already_decided",
@@ -75,6 +77,54 @@ class Approval:
 class Decision:
     status: DecisionStatus
     approval: Approval | None = None  # Present only for a committed claim.
+
+
+@dataclass(frozen=True)
+class CurateFileResult:
+    op_id: str
+    base_sha256: str | None  # NULL for an absence precondition.
+    result_sha256: str | None
+    status: CurateFileStatus | None = None
+
+
+def _curate_files(payload: str) -> list[CurateFileResult]:
+    """Extract the journal from the exact serialized v1 proposal, without reading the vault."""
+    if not isinstance(payload, str) or len(payload.encode()) > 64 * 1024:
+        raise ValueError("expected a serialized curate proposal of at most 64 KiB")
+    spec = json.loads(payload)
+    if (not isinstance(spec, dict) or type(spec.get("version")) is not int or spec["version"] != 1
+            or not {"root_id", "policy_hash", "sources", "ops"} <= spec.keys()):
+        raise ValueError("expected a version 1 curate proposal")
+    ops = spec["ops"]
+    if not isinstance(ops, list) or not 1 <= len(ops) <= 16:
+        raise ValueError("expected 1 to 16 curate operations")
+    files = []
+    paths = set()
+    ids = set()
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ValueError("expected a curate operation")
+        op_id, path = op.get("id"), op.get("path")
+        if (not isinstance(op_id, str) or not re.fullmatch(r"P[1-9][0-9]*", op_id) or op_id in ids
+                or not isinstance(path, str) or not path or path in paths):
+            raise ValueError("expected distinct curate operation IDs and paths")
+        dependencies = op.get("depends_on")
+        if (not isinstance(op.get("content"), str) or not isinstance(dependencies, list)
+                or not all(isinstance(dep, str) and dep in ids for dep in dependencies)):
+            raise ValueError("expected serialized content and earlier dependencies")
+        digest = op.get("result_sha256")
+        if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
+            raise ValueError("expected a result SHA-256")
+        base = op.get("base_sha256")
+        if op.get("kind") == "append":
+            if not isinstance(base, str) or not re.fullmatch("[0-9a-f]{64}", base) or "file_id" not in op:
+                raise ValueError("expected an append precondition")
+        elif op.get("kind") != "create" or op.get("absent") is not True or base is not None:
+            raise ValueError("expected a create precondition")
+        files.append(CurateFileResult(op_id, base, digest))
+        paths.add(path)
+        ids.add(op_id)
+    return files
 
 
 @dataclass(frozen=True)
@@ -147,11 +197,10 @@ _SCHEMA_V1 = (
     """,
 )
 
-_MIGRATE_V1_TO_V2 = (
-    """
-    CREATE TABLE approvals (
+_CREATE_APPROVALS = """
+    CREATE TABLE {table} (
         id TEXT PRIMARY KEY NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('note.create', 'brain.import')),
+        kind TEXT NOT NULL CHECK ({kind_check}),
         owner TEXT NOT NULL,
         allowed_channel TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -168,7 +217,8 @@ _MIGRATE_V1_TO_V2 = (
             OR (payload IS NULL AND payload_hash IS NULL AND status NOT IN ('pending', 'executing'))
         )
     )
-    """,
+    """
+_APPROVAL_INDEX_AND_TRIGGER = (
     "CREATE INDEX approvals_status_created ON approvals (status, created_at, id)",
     """
     CREATE TRIGGER approvals_immutable_payload
@@ -181,6 +231,11 @@ _MIGRATE_V1_TO_V2 = (
     """,
 )
 
+_OLD_APPROVAL_KINDS = "kind IN ('note.create', 'brain.import')"
+_MIGRATE_V1_TO_V2 = (
+    _CREATE_APPROVALS.format(table="approvals", kind_check=_OLD_APPROVAL_KINDS),
+    *_APPROVAL_INDEX_AND_TRIGGER,
+)
 
 _CREATE_RECORDS_NEW = """
     CREATE TABLE records_new (
@@ -225,15 +280,16 @@ _REBUILD_RECORDS = (
 )
 
 
+_CREATE_TELEGRAM_PROPOSALS = """
+    CREATE TABLE {table} (
+        approval_id TEXT PRIMARY KEY NOT NULL REFERENCES {parent} (id),
+        message_id INTEGER NOT NULL CHECK (message_id > 0)
+    )
+    """
 _MIGRATE_V2_TO_V3 = (
     _CREATE_RECORDS_NEW.format(record_kinds="'ask', 'recall', 'approval'"),
     *_REBUILD_RECORDS,
-    """
-    CREATE TABLE telegram_note_proposals (
-        approval_id TEXT PRIMARY KEY NOT NULL REFERENCES approvals (id),
-        message_id INTEGER NOT NULL CHECK (message_id > 0)
-    )
-    """,
+    _CREATE_TELEGRAM_PROPOSALS.format(table="telegram_note_proposals", parent="approvals"),
 )
 _MIGRATE_V3_TO_V4 = (
     _CREATE_RECORDS_NEW.format(record_kinds="'ask', 'recall', 'approval', 'local', 'notice'"),
@@ -279,9 +335,40 @@ _MIGRATE_V6_TO_V7 = (
     END
     """,
 )
+_MIGRATE_V7_TO_V8 = (
+    _CREATE_APPROVALS.format(table="approvals_new", kind_check=(
+        _OLD_APPROVAL_KINDS + " OR (kind = 'brain.curate' AND allowed_channel = 'cli')"
+    )),
+    "INSERT INTO approvals_new SELECT * FROM approvals",
+    _CREATE_TELEGRAM_PROPOSALS.format(table="telegram_note_proposals_new", parent="approvals_new"),
+    "INSERT INTO telegram_note_proposals_new SELECT * FROM telegram_note_proposals",
+    "DROP TABLE telegram_note_proposals",
+    "DROP TABLE approvals",
+    "ALTER TABLE approvals_new RENAME TO approvals",
+    "ALTER TABLE telegram_note_proposals_new RENAME TO telegram_note_proposals",
+    *_APPROVAL_INDEX_AND_TRIGGER,
+    """
+    CREATE TABLE curate_file_results (
+        approval_id TEXT NOT NULL REFERENCES approvals (id),
+        op_id TEXT NOT NULL,
+        base_sha256 TEXT,
+        result_sha256 TEXT,
+        status TEXT CHECK (status IN ('done', 'conflict', 'failed', 'dependency_incomplete', 'unknown')),
+        PRIMARY KEY (approval_id, op_id)
+    )
+    """,
+    """
+    CREATE TRIGGER curate_terminal AFTER UPDATE OF status ON approvals
+    WHEN NEW.kind = 'brain.curate' AND NEW.status IN ('expired', 'rejected', 'done', 'failed')
+    BEGIN
+        DELETE FROM curate_file_results WHERE approval_id = NEW.id AND status IS NULL;
+        UPDATE curate_file_results SET base_sha256 = NULL, result_sha256 = NULL WHERE approval_id = NEW.id;
+    END
+    """,
+)
 _MIGRATIONS = (
     _SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3, _MIGRATE_V3_TO_V4, _MIGRATE_V4_TO_V5,
-    _MIGRATE_V5_TO_V6, _MIGRATE_V6_TO_V7,
+    _MIGRATE_V5_TO_V6, _MIGRATE_V6_TO_V7, _MIGRATE_V7_TO_V8,
 )
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -543,6 +630,9 @@ class Store:
         expires = _utc_timestamp(expires_at, "expires_at")
         if expires <= created:
             raise ValueError("expires_at must be after created_at")
+        if kind == "brain.curate" and expires - created != timedelta(hours=24):
+            raise ValueError("brain.curate expires after 24 hours")
+        files = _curate_files(payload) if kind == "brain.curate" else []
         row = db.execute(
             """
             INSERT INTO approvals (
@@ -558,6 +648,12 @@ class Store:
                 payload, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
             ),
         ).fetchone()
+        if files:
+            db.executemany(
+                """INSERT INTO curate_file_results (approval_id, op_id, base_sha256, result_sha256)
+                   VALUES (?, ?, ?, ?)""",
+                [(row["id"], f.op_id, f.base_sha256, f.result_sha256) for f in files],
+            )
         return Approval(**dict(row))
 
     def create_telegram_note_proposal(
@@ -651,7 +747,10 @@ class Store:
         now: datetime | None, update_key: str | None, executor: tuple[int, str] | None,
         available_kinds: Collection[ApprovalKind] | None,
     ) -> Decision:
-        row = db.execute("SELECT * FROM approvals WHERE id = ?", (id,)).fetchone()
+        row = db.execute(
+            "SELECT * FROM approvals WHERE id = ? AND (kind != 'brain.curate' OR ? = 'cli')",
+            (id, channel),
+        ).fetchone()
         if row is None:
             return Decision("not_found")
         if channel == "telegram" and row["kind"] == "brain.import":
@@ -704,11 +803,56 @@ class Store:
             raise sqlite3.DatabaseError("approval decision did not update one row")
         return Decision("claimed", Approval(**dict(rows[0]))) if approve else Decision("rejected")
 
+    def curate_file_results(self, id: str) -> list[CurateFileResult]:
+        """Read the local journal in manifest order. Only statuses survive finalization."""
+        with self._connect() as db:
+            return [CurateFileResult(**dict(row)) for row in db.execute(
+                """SELECT op_id, base_sha256, result_sha256, status FROM curate_file_results
+                   WHERE approval_id = ? ORDER BY rowid""", (id,),
+            )]
+
+    def record_curate_result(
+        self, id: str, op_id: str, status: CurateFileStatus, *, executor: tuple[int, str],
+    ) -> bool:
+        """Commit one verified outcome once, on behalf of the process holding the claim."""
+        if status is None:
+            raise ValueError("a file outcome is required")
+        with self._connect() as db:
+            return db.execute(
+                """
+                UPDATE curate_file_results SET status = ?
+                WHERE approval_id = ? AND op_id = ? AND status IS NULL AND EXISTS (
+                    SELECT 1 FROM approvals WHERE id = curate_file_results.approval_id
+                    AND status = 'executing' AND executor_pid = ? AND executor_started_at = ?
+                )
+                """,
+                (status, id, op_id, *executor),
+            ).rowcount == 1
+
+    def curate_result_counts(self, id: str) -> dict[CurateFileStatus, int]:
+        """Return the local per-status totals, excluding files still awaiting an outcome."""
+        with self._connect() as db:
+            return dict(db.execute(
+                """SELECT status, COUNT(*) FROM curate_file_results
+                   WHERE approval_id = ? AND status IS NOT NULL GROUP BY status""", (id,),
+            ))
+
     def finish_approval(
         self, id: str, *, ok: bool, executor: tuple[int, str], chunks: list[str] | None = None,
     ) -> bool:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # A batch verdict comes from its journal. Keep unfinished claims recoverable.
+            counts = dict(db.execute(
+                """SELECT f.status, COUNT(*) FROM approvals a
+                   LEFT JOIN curate_file_results f ON f.approval_id = a.id
+                   WHERE a.id = ? AND a.kind = 'brain.curate' GROUP BY f.status""",
+                (id,),
+            ))
+            if None in counts:
+                return False
+            if counts:
+                ok = counts.keys() == {"done"}
             status = "done" if ok else "failed"
             row = db.execute(
                 """

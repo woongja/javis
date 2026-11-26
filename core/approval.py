@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from worklog import Approval, ApprovalKind, Decision, Store
+from worklog import Approval, ApprovalKind, CurateFileStatus, Decision, Store
 from worklog.store import DecisionStatus
 
 
@@ -25,7 +25,15 @@ def _import_payload(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
 
 
-_PAYLOAD_VALIDATORS = {"note.create": _note_payload, "brain.import": _import_payload}
+def _curate_payload(payload: object) -> str:
+    if not isinstance(payload, str):
+        raise ValueError("brain.curate requires a serialized proposal")
+    return payload
+
+
+_PAYLOAD_VALIDATORS = {
+    "note.create": _note_payload, "brain.import": _import_payload, "brain.curate": _curate_payload,
+}
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,8 @@ class ApprovalService:
         validator = _PAYLOAD_VALIDATORS.get(kind)
         if validator is None:
             raise ValueError("unsupported approval kind")
+        if kind == "brain.curate" and (channel != "cli" or owner != os_user()):
+            raise ValueError("brain.curate requires the local OS user and PC channel")
         created = datetime.now(UTC) if now is None else now
         if created.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
@@ -94,6 +104,9 @@ class ApprovalService:
     def execute(self, claim: Approval) -> ExecutionResult:
         result = self.executors[claim.kind](claim)
         return result if isinstance(result, ExecutionResult) else ExecutionResult(result)
+
+    def record_curate_result(self, id: str, op_id: str, status: CurateFileStatus) -> bool:
+        return self._store.record_curate_result(id, op_id, status, executor=_executor_identity())
 
     def finish(self, id: str, ok: bool, *, chunks: list[str] | None = None) -> bool:
         """Finalize a claim made by the current process."""
