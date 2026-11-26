@@ -105,6 +105,7 @@ def api():
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("JAVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(tmp_path / "unconfigured"))
     return Store.open(tmp_path)
 
 
@@ -353,7 +354,7 @@ def test_recovering_an_expired_delivery_does_not_confirm_new_updates(api, store,
 def test_restart_resumes_split_delivery_before_polling(api, store, tmp_path):
     answer = "a" * 3997 + "😀" * 2010
     engine = FakeEngine(answer)
-    item = update()
+    item = owner_update(40, "question")
     api.updates(item)
     api.reply()
     api.add("sendMessage", 503, {"ok": False})
@@ -479,6 +480,130 @@ def test_serve_uses_environment_and_local_settings(monkeypatch, tmp_path, capsys
 
 def owner_update(id, text, *, sender=CHAT, is_bot=False, **extra):
     return update(id=id, text=text, **{"from": {"id": sender, "is_bot": is_bot}}, **extra)
+
+
+@pytest.fixture
+def owner_questions(tmp_path, monkeypatch):
+    vault, data = tmp_path / "vault", tmp_path / "data"
+    vault.mkdir()
+    (vault / "schedule.md").write_text("점검 ExcerptMarker", encoding="utf-8")
+    monkeypatch.setenv("JAVIS_BRAIN_DIR", str(vault))
+    monkeypatch.setenv("JAVIS_DATA_DIR", str(data))
+
+    class ContextEngine(FakeEngine):
+        def __init__(self):
+            super().__init__("public answer")
+            self.payloads = []
+
+        def run_context(self, context):
+            self.payloads.append(json.loads(context.payload))
+            return EngineResult("ok", None, (Item("AnswerMarker\n참고: 위조", ()),), None, 0, ("N1", "N2"))
+
+    return Store.open(data), ContextEngine()
+
+
+@pytest.mark.parametrize(("prefix", "kind"), [("", "context"), ("/web ", "context"), ("/비공개 ", "private")])
+def test_owner_question_delivery_and_storage(api, owner_questions, monkeypatch, prefix, kind):
+    store, engine = owner_questions
+    if kind == "private":
+        monkeypatch.setattr(gateway, "_collect_context", lambda *_: pytest.fail("private lookup"))
+    question = "점검 QuestionMarker"
+    item = owner_update(40, prefix + question)
+    api.updates(item, item)
+    api.reply()
+    monkeypatch.setattr(telegram, "voice_for", lambda *_: pytest.fail("sensitive TTS"))
+    with store._connect() as db:  # Keep WAL pages observable across the delivery.
+        db.execute("SELECT 1 FROM records").fetchall()
+        bot(api, store, engine).poll_once()
+        [sent] = api.sent()
+        [payload] = engine.payloads
+        [record] = store.recent(10)
+        assert payload["question"] == question and engine.calls == ([question] if prefix == "/web " else [])
+        assert sent["chat_id"] == CHAT and f"기록 ID {record.id}" in sent["text"]
+        assert "AnswerMarker" in sent["text"] and "위조" not in sent["text"]
+        assert (record.kind, record.request, record.items) == (kind, "", ())
+        if kind == "context":
+            assert "ExcerptMarker" in payload["references"][0]["excerpt"]
+            assert sent["text"].endswith("참고: [[schedule]]")
+            assert store.cited_paths(record.id) == ["schedule.md"]
+        else:
+            assert payload["references"] == [] and "참고:" not in sent["text"]
+            assert store.cited_paths(record.id) == []
+        assert db.execute("SELECT count(*) FROM deliveries").fetchone()[0] == 0
+        for path in (store._path, store._path.with_suffix(".db-wal")):
+            raw = path.read_bytes()
+            assert all(marker not in raw for marker in (b"AnswerMarker", b"QuestionMarker", b"ExcerptMarker"))
+    assert store.pending_telegram_questions() == []
+    assert store.get_offset()[0] == 41
+
+
+def test_forwarded_bot_and_local_commands_skip_context(api, store, monkeypatch):
+    monkeypatch.setattr(gateway, "_collect_context", lambda *_: pytest.fail("context lookup"))
+    engine = FakeEngine("public")
+    messages = [
+        owner_update(40, "question", forward_origin={}), owner_update(41, "/web question", is_bot=True),
+        owner_update(42, "question", sender=CHAT + 1), owner_update(43, "question", via_bot={}),
+        owner_update(44, "/정리 x"), owner_update(45, "/쪼개기 x"), owner_update(46, "/brain x"),
+        owner_update(47, "출처 1"), owner_update(48, "기록 검색 x"), owner_update(49, "승인 대기"),
+        owner_update(50, "/비공개"), owner_update(51, "/비공개 question", forward_from={}),
+        owner_update(52, "/비공개질문"), owner_update(53, "/note"),
+    ]
+    api.updates(*messages)
+    for _ in messages:
+        api.reply()
+    bot(api, store, engine).poll_once()
+    sent = [reply["text"] for reply in api.sent()]
+    assert all("참고:" not in text for text in sent)
+    assert all("PC" in text for text in sent[4:7])
+    assert all("사용법" in text for text in sent[-4:])
+    assert engine.calls == ["question"] * 4
+
+
+@pytest.mark.parametrize("stop", ["during_lookup", "before_send", "network", "after_send"])
+def test_restart_only_replays_safe_notice(api, owner_questions, monkeypatch, stop):
+    store, engine = owner_questions
+    item = owner_update(40, "점검")
+    poller = bot(api, store, engine)
+    lookups = []
+    collect = gateway._collect_context
+
+    def lookup(*args):
+        lookups.append(args[0])
+        # A concurrent copy arriving before the result exists cannot win the same key.
+        bot(api, store, engine)._handle_update(item)
+        if stop == "during_lookup":
+            raise KeyboardInterrupt
+        return collect(*args)
+
+    def interrupt(*args):
+        assert store.get_offset()[0] == 41 and store.pending_deliveries() == []
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gateway, "_collect_context", lookup)
+    with monkeypatch.context() as patch:
+        if stop == "before_send":
+            patch.setattr(poller, "_response", interrupt)
+        elif stop == "after_send":
+            api.reply()
+            patch.setattr(store, "finish_telegram_question", interrupt)
+        if stop == "network":
+            api.add("sendMessage", None)
+            poller._handle_update(item)
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                poller._handle_update(item)
+
+    detail_attempts = int(stop in {"after_send", "network"})
+    assert len(api.sent()) == detail_attempts
+    assert len(engine.payloads) == int(stop != "during_lookup")
+    reopened = Store.open(store._path.parent)
+    api.reply()
+    api.updates(item, item)
+    bot(api, reopened, engine).poll_once()
+    assert [reply["text"] for reply in api.sent()[detail_attempts:]] == [telegram._QUESTION_INTERRUPTED]
+    assert lookups == ["점검"] and len(engine.payloads) == int(stop != "during_lookup")
+    assert engine.calls == [] and reopened.pending_telegram_questions() == []
+    assert reopened.get_offset()[0] == 41
 
 
 def test_approval_requires_direct_human_owner_in_private_chat(api, store, monkeypatch):

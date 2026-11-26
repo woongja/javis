@@ -356,6 +356,7 @@ def test_stt_sends_only_a_draft(api, store, enabled, transcription, tmp_path, mo
     before_files = set(tmp_path.rglob("*"))
     engine = FakeEngine()
     monkeypatch.setattr(telegram, "handle", lambda *args: pytest.fail("gateway called"))
+    monkeypatch.setattr(gateway, "_collect_context", lambda *_: pytest.fail("transcript context lookup"))
     monkeypatch.setattr(ApprovalService, "decide", lambda *args: pytest.fail("approval decision called"))
     monkeypatch.setattr(store, "search", lambda *args: pytest.fail("search called"))
     item = audio_update(field="audio", metadata={"mime_type": "audio/mp4"})

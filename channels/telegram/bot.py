@@ -20,8 +20,9 @@ from uuid import uuid4
 from core.approval import ApprovalService, Executor
 from core.config import VoiceSettingsError, data_dir, load_voice_settings
 from core.engine import Engine
-from core.gateway import Request, handle
+from core.gateway import Reply, Request, _Question, _cli_answer, _failure, _render, handle
 from core.note import NOTE_EXECUTORS
+from core.recall import recall
 from core.voice import Audio, voice_for
 from core.voice_elevenlabs import ElevenLabsError
 from worklog.store import ApprovalKind, Record, Store
@@ -55,6 +56,7 @@ _CHUNK_LIMIT = 4000
 _DEFERRED_ID = 1000000000000000000
 _ID_FOOTER = f"\n\n기록 ID {_DEFERRED_ID}"
 _SAFE_ERROR = "응답을 처리하지 못했습니다."
+_QUESTION_INTERRUPTED = "답변 전달을 확인할 수 없습니다. 질문을 다시 보내 주세요."
 _APPROVAL_ID = re.compile(r"[0-9a-fA-F]{32}")
 _APPROVAL_USAGE = "사용법: 승인 대기 / 승인 <ID> / 거절 <ID>"
 _PC_ONLY = "brain.import는 PC에서만 확인하고 결정할 수 있습니다."
@@ -87,12 +89,14 @@ class _DeferredSave:
     def __init__(self, store: Store):
         self.store = store
         self.record: Record
+        self.cited_sources: tuple[str, ...] = ()
 
     def __getattr__(self, name):
         return getattr(self.store, name)
 
-    def save(self, record: Record) -> int:
+    def save(self, record: Record, *, cited_sources=()) -> int:
         self.record = record
+        self.cited_sources = tuple(cited_sources)
         return _DEFERRED_ID
 
 
@@ -437,6 +441,66 @@ class TelegramBot:
             and not message.get("is_automatic_forward")
         )
 
+    def _resume_question_notices(self) -> None:
+        # Only the single poller's recovery path retries, and it has no answer bytes.
+        for key, created in self._store.pending_telegram_questions():
+            offset = self._delivery_offset(int(key.split(":", 1)[0]) + 1, created)
+            notice = self._question_record(key, created)
+            recovered = self._store.save_telegram_question(notice, offset=offset)
+            if recovered is not None and offset is not None:
+                self._cursor = (offset, self._now())
+            try:
+                self._request("sendMessage", {
+                    "chat_id": self._chat_id, "text": _QUESTION_INTERRUPTED,
+                    "link_preview_options": {"is_disabled": True},
+                })
+            except TelegramError as error:
+                if error.code not in (400, 403):
+                    raise
+            self._store.finish_telegram_question(key)
+
+    @staticmethod
+    def _question_record(key: str, now: datetime) -> Record:
+        return Record(
+            id=None, created_at=now.astimezone(UTC).isoformat(), channel="telegram",
+            kind="notice", request="", items=(), status="error", reason=None, engine=None,
+            model=None, duration_s=None, ref_id=None, update_key=key,
+        )
+
+    def _answer_question(self, question: _Question, text: str, key: str, staged: _DeferredSave, now: datetime) -> Reply:
+        record = self._question_record(key, now)
+        answer = _cli_answer(question, staged, self._engine, record)
+        if isinstance(answer, Reply):
+            return answer
+        result = answer.result
+        record_id = staged.save(replace(
+            record, kind="ask", request=text, items=result.items, status=result.status,
+            reason=result.reason, engine="claude", model=result.model, duration_s=result.duration_s,
+        ))
+        message = _render(result.items) if result.status == "ok" else _failure(result)
+        return Reply(message + _ID_FOOTER, record_id, "web")
+
+    def _send_sensitive(self, staged: _DeferredSave, text: str, key: str, offset: int) -> None:
+        record, sources = staged.record, staged.cited_sources
+        if self._token in text or any(self._token in path for path in sources):
+            record, text, sources = replace(record, status="error"), _SAFE_ERROR, ()
+        advance = self._delivery_offset(offset, datetime.fromisoformat(record.created_at))
+        record_id = self._store.save_telegram_question(record, cited_sources=sources, offset=advance)
+        if record_id is None:
+            return
+        if advance is not None:
+            self._cursor = (advance, self._now())
+        body, footer, references = text.rpartition(_ID_FOOTER)
+        if footer:
+            text = f"{body}\n\n기록 ID {record_id}{references}"
+        for chunk in _split(text):
+            status, response = self._response("sendMessage", {
+                "chat_id": self._chat_id, "text": chunk, "link_preview_options": {"is_disabled": True},
+            })
+            if not 200 <= status < 300 or response.get("ok") is not True:
+                return
+        self._store.finish_telegram_question(key)
+
     def _handle_approval(self, message: dict, words: list[str], key: str) -> None:
         now = self._now()
         if not self._direct_owner(message):
@@ -520,10 +584,34 @@ class TelegramBot:
         def submit_note(body: str, now: datetime) -> None:
             self._approvals.propose_telegram_note(body, str(self._chat_id), message_id, key, now, self._approval_chunks)
 
-        can_propose = self._direct_owner(message) and type(message_id) is int and 0 < message_id < 2**63
+        direct = self._direct_owner(message)
+        can_propose = direct and type(message_id) is int and 0 < message_id < 2**63
         staged = _DeferredSave(self._store)
         request = Request("telegram", text, key, submit_note if can_propose else None)
-        reply = handle(request, staged, self._engine, self._now())
+        now = self._now()
+        owner_text = (direct and not message.get("is_from_offline")
+                      and not {"via_bot", "sender_chat", "sender_business_bot"}.intersection(message))
+        question = None
+        if owner_text and words[0] in {"/web", "/비공개"} and len(words) > 1:
+            question = _Question(text.split(maxsplit=1)[1], "private" if words[0] == "/비공개" else "web")
+        elif (owner_text and not words[0].startswith("/") and words[:2] != ["기록", "검색"]
+              and recall(text, self._store, now) is None):
+            question = _Question(text, "auto")
+
+        if question is not None:
+            if not self._store.claim_telegram_question(key, now):
+                return
+            reply = self._answer_question(question, text, key, staged, now)
+        elif words[0] in {"/정리", "/쪼개기", "/split", "/비공개"}:
+            notice = ("사용법: /비공개 <질문> · 소유자가 직접 보낸 질문만 Anthropic에 전달합니다."
+                       if words[0] == "/비공개" else "정리와 원본 쪼개기는 PC에서 실행해 주세요.")
+            record_id = staged.save(self._question_record(key, now))
+            reply = Reply(notice + _ID_FOOTER, record_id, "notice")
+        else:
+            reply = handle(request, staged, self._engine, now)
+        if reply.kind in {"context", "private"}:
+            self._send_sensitive(staged, reply.text, key, offset)
+            return
         if reply.kind == "note":
             self._resume_deliveries()
             return
@@ -540,12 +628,16 @@ class TelegramBot:
             chunks = [_SAFE_ERROR]
         else:
             chunks = _reply_chunks(reply.text)
-        record_id = self._store.save(record, chunks=chunks)
+        if question is None:
+            record_id = self._store.save(record, chunks=chunks)
+        else:
+            record_id = self._store.save_telegram_question(record, chunks=chunks)
         delivered = self._resume_deliveries()
         if record_id in delivered and record.kind == "ask" and record.status == "ok":
             self._send_voice_reply(record)
 
     def poll_once(self) -> None:
+        self._resume_question_notices()
         self._resume_deliveries()
         payload = {"timeout": _POLL_TIMEOUT, "allowed_updates": ["message"]}
         for update in self._request("getUpdates", payload):

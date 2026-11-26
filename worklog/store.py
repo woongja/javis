@@ -269,9 +269,19 @@ _MIGRATE_V5_TO_V6 = (
     END
     """,
 )
+_MIGRATE_V6_TO_V7 = (
+    "CREATE TABLE telegram_question_attempts (update_key TEXT PRIMARY KEY NOT NULL, created_at TEXT NOT NULL)",
+    """
+    CREATE TRIGGER forget_telegram_question AFTER DELETE ON records
+    WHEN OLD.update_key IS NOT NULL
+    BEGIN
+        DELETE FROM telegram_question_attempts WHERE update_key = OLD.update_key;
+    END
+    """,
+)
 _MIGRATIONS = (
     _SCHEMA_V1, _MIGRATE_V1_TO_V2, _MIGRATE_V2_TO_V3, _MIGRATE_V3_TO_V4, _MIGRATE_V4_TO_V5,
-    _MIGRATE_V5_TO_V6,
+    _MIGRATE_V5_TO_V6, _MIGRATE_V6_TO_V7,
 )
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -467,6 +477,48 @@ class Store:
     @staticmethod
     def _has_update(db: sqlite3.Connection, key: str) -> bool:
         return db.execute("SELECT 1 FROM records WHERE update_key = ?", (key,)).fetchone() is not None
+
+    def claim_telegram_question(self, key: str, now: datetime) -> bool:
+        """Reserve the update before either context lookup or the first web call."""
+        with self._connect() as db:
+            return db.execute(
+                """
+                INSERT INTO telegram_question_attempts (update_key, created_at)
+                SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM records WHERE update_key = ?)
+                ON CONFLICT (update_key) DO NOTHING
+                """,
+                (key, _approval_time(now), key),
+            ).rowcount == 1
+
+    def save_telegram_question(
+        self, record: Record, *, chunks: list[str] | None = None,
+        cited_sources: Collection[str] = (), offset: int | None = None,
+    ) -> int | None:
+        """Commit the claimed result once, along with its cursor or resumable web chunks."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            claimed = db.execute(
+                "SELECT 1 FROM telegram_question_attempts WHERE update_key = ?", (record.update_key,)
+            ).fetchone()
+            if claimed is None or self._has_update(db, record.update_key):
+                return None
+            record_id = self._save(db, record, chunks, cited_sources)
+            if chunks is not None:
+                # Public answers now belong to the durable chunk delivery worker.
+                db.execute("DELETE FROM telegram_question_attempts WHERE update_key = ?", (record.update_key,))
+            if offset is not None:
+                self._set_offset(db, offset)
+            return record_id
+
+    def pending_telegram_questions(self) -> list[tuple[str, datetime]]:
+        with self._connect() as db:
+            return [(key, datetime.fromisoformat(created)) for key, created in db.execute(
+                "SELECT update_key, created_at FROM telegram_question_attempts ORDER BY rowid"
+            )]
+
+    def finish_telegram_question(self, key: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM telegram_question_attempts WHERE update_key = ?", (key,))
 
     def create_approval(
         self,
