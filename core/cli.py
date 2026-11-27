@@ -19,7 +19,7 @@ from worklog import Store
 from .approval import ApprovalService, is_interrupted, os_user as _os_user
 from .config import VoiceSettingsError, data_dir, load_settings, load_voice_settings
 from .engine import ClaudeEngine
-from .gateway import Request, handle
+from .gateway import Request, handle, pc_approval_preview
 from .note import NOTE_EXECUTORS, approval_summary, decide_on_pc, planned_copy
 from .recall import question_preview
 from .search import search_reply
@@ -159,6 +159,9 @@ def _list_pending(store: Store, actor: str) -> int:
         if row.can_decide(actor, "cli") and is_interrupted(row)
     ]
     for row in pending + interrupted:
+        if row.kind == "brain.curate" and row.status == "pending":
+            print(pc_approval_preview(row))
+            continue
         expires = datetime.fromisoformat(row.expires_at).astimezone()
         summary = approval_summary(row)
         if row.kind == "note.create":
@@ -170,6 +173,10 @@ def _list_pending(store: Store, actor: str) -> int:
 
 def _decide(store: Store, id: str, actor: str, *, approve: bool) -> int:
     service = ApprovalService(store, NOTE_EXECUTORS)
+    row = store.get_approval(id)
+    if (row and row.kind == "brain.curate" and row.status == "pending"
+            and row.can_decide(actor, "cli") and datetime.fromisoformat(row.expires_at) > datetime.now(UTC)):
+        print(pc_approval_preview(row))
     status, message = decide_on_pc(store, service, id, actor, approve=approve)
     if status == "executor_missing":
         return _approval_message(f"{message}: 실행기 미등록")
@@ -253,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     external = (
         "일반 질문은 관련 노트·기록과 함께 Claude로 전송되며, 맥락이 없으면 웹을 검색합니다. "
         "/web <질문>은 질문만 웹 검색에 사용합니다. "
-        "/비공개 <질문>은 질문만 Anthropic에 보내며 검색과 본문 저장을 끕니다."
+        "/비공개 <질문>은 질문만 Anthropic에 보내며 검색과 본문 저장을 끕니다. "
+        "PC의 /정리 <내용>은 입력과 관련 정리 노트를 Claude에 보내 승인할 변경을 제안합니다."
     )
     parser = argparse.ArgumentParser(
         prog="javis", description="Ask javis, view the local worklog, and manage approvals.", epilog=external,

@@ -1,10 +1,18 @@
-from datetime import UTC, datetime
+import json
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from brain import append as adapter
+from brain.curate import NOTES, serialize_note
+from brain.publish import pin_root
 from core import cli
+from core.curate import conversation_prompt
 from core.engine import ClaudeEngine
-from tests.test_core_engine import fake_claude, success
+from core.gateway import Request, handle
+from tests.test_core_engine import fake_claude, recording_cli, success
+from tests.test_curate_proposal import EXAMPLE, EXISTING, NOTE, append, create, write
 from tests.test_telegram import CHAT, api, bot, owner_update
 from worklog import Store
 
@@ -171,3 +179,96 @@ def test_note_without_configured_brain_creates_no_approval(api, configured, monk
     assert "JAVIS_BRAIN_DIR" in api.sent()[0]["text"]
     assert store.list_approvals("pending") == []
     assert_private(store, capture)
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject", "expire"])
+def test_curate_cli_reviews_the_bytes_before_deciding(configured, tmp_path, monkeypatch, capsys, decision):
+    vault, store, _ = configured
+    write(vault, EXISTING, EXAMPLE)
+    write(vault, "me/원본.md", "점검 ORIGINAL_ONLY".encode())
+    response = {"ops": [create(), append("P2", conflicts=["점검일 확인"])]}
+    engine, calls = recording_cli(tmp_path, {"items": [{"text": json.dumps(response)}], "used_ids": ["N1"]})
+    monkeypatch.setattr(cli, "ClaudeEngine", lambda _: engine)
+    writes = []
+
+    def exchange(directory, root, approval_id=None, op=None):
+        if op is not None:
+            assert store.get_approval(approval_id).status == "executing"
+            target = vault / op["path"]
+            target.write_bytes(adapter.verified_append(target.read_bytes(), op, []))
+            writes.append(op["path"])
+            return "ok"
+
+    monkeypatch.setattr(adapter, "exchange", exchange)
+    question = "/정리 점검 장소는 모형실"
+    assert cli.main(["ask", question]) == 0
+    [draft] = store.list_approvals("pending")
+    shown = capsys.readouterr().out
+    for part in ("새 노트 1개 / 기존 노트에 사실·링크 추가 1개 / 목차 0개", EXISTING,
+                 "출처: 점검 장소는 모형실", "- 사실: 추가 사실", "점검일 확인", draft.id,
+                 draft.expires_at, "어댑터 연결됨"):
+        assert part in shown
+    assert cli.main(["pending"]) == 0 and capsys.readouterr().out == shown
+    initial = {p: p.read_bytes() for p in vault.rglob("*.md")}
+    assert list(initial.values()).count(EXAMPLE) == 1 and len(initial) == 2 and not writes
+    sent = calls.read_bytes()
+    (_, probe), (argv, body) = map(json.loads, sent.splitlines())
+    assert not probe and argv[argv.index("--tools") + 1] == ""
+    payload = json.loads(body)
+    assert payload["input"] == "점검 장소는 모형실"
+    [ref] = payload["references"]
+    assert ref["id"] == "N1" and "모형실" in ref["excerpt"]
+    assert all(private not in body for private in ("me/", "javis/wiki/", "ORIGINAL_ONLY"))
+    assert store.telegram_pending_notes(str(CHAT), datetime.now(UTC)) == []
+    assert not store.recent(1)[0].request
+    if decision == "expire":
+        with store._connect() as db:
+            db.execute("UPDATE approvals SET expires_at = ? WHERE id = ?",
+                       ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), draft.id))
+        assert cli.main(["approve", draft.id]) == 1
+        assert_finished(store, draft, "expired")
+    else:
+        assert cli.main([decision, draft.id]) == 0
+        assert shown.strip() in capsys.readouterr().out
+        assert_finished(store, draft, "done" if decision == "approve" else "rejected")
+    if decision == "approve":
+        assert (vault / EXISTING).read_bytes() == EXAMPLE + "- 사실: 추가 사실\n".encode()
+        created, _ = json.loads(draft.payload)["ops"]
+        assert (vault / created["path"]).read_bytes() == created["content"].encode()
+        assert cli.main(["approve", draft.id]) == 1 and writes == [EXISTING]
+    else:
+        assert {p: p.read_bytes() for p in vault.rglob("*.md")} == initial and not writes
+    assert calls.read_bytes() == sent
+
+
+@pytest.mark.parametrize("padding", [0, 420])
+def test_curate_uses_only_bounded_related_note_excerpts(configured, padding):
+    vault, _, _ = configured
+    for i in range(8):
+        title = f"항목 {i}"
+        note = replace(NOTE, title=title, facts=(f"{i}" + "가" * padding + f' 점검 "{i}"',))
+        write(vault, NOTES + title + ".md", serialize_note(note))
+    prompt = conversation_prompt("점검", pin_root(vault))
+    refs = json.loads(prompt.payload)["references"]
+    block = json.dumps({"references": refs}, ensure_ascii=False, separators=(",", ":"))
+    assert 0 < len(refs) <= 6 and len(block.encode()) <= 4096
+    if padding == 0:
+        assert len(refs) == 6
+    for ref in refs:
+        assert "점검" in ref["excerpt"] and len(ref["excerpt"].encode()) <= 1024
+        assert set(ref) == {"id", "type", "excerpt"}
+    assert set(prompt.evidence) == {"conversation", *(ref["id"] for ref in refs)}
+
+
+def test_curate_usage_and_phone_do_not_call_engine(api, configured, capsys):
+    vault, store, capture = configured
+    for text in ("/정리", "/정리  \t", "/정리 /web 질문", "/정리 /정리 본문"):
+        assert cli.main(["ask", text]) == 1
+        assert "사용법: /정리 <내용>" in capsys.readouterr().out
+    engine = cli.ClaudeEngine(cli.load_settings())
+    assert "PC 전용" in handle(Request("telegram", "/정리 점검"), store, engine).text
+    api.updates(owner_update(60, "/정리 점검"))
+    api.reply()
+    bot(api, store, engine).poll_once()
+    assert "PC" in api.sent()[-1]["text"]
+    assert not store.list_approvals("pending") and not list(vault.iterdir()) and not capture.exists()

@@ -9,8 +9,10 @@ from urllib.parse import urlencode
 import pytest
 
 from core.approval import ApprovalService, os_user
+from core.curate import build_proposal
 from core.note import NOTE_EXECUTORS, note_path
 from hud.server import HUDServer
+from tests.test_curate_proposal import create, prepare
 from worklog import Item, Record, Store
 
 
@@ -148,7 +150,7 @@ def test_state_preserves_markup_shaped_display_values(hud, monkeypatch):
         summaries[approval.id] = value
     # Actual approval summaries only expose valid paths and counts. Substitute a
     # markup-shaped summary at that boundary to exercise JSON serialization.
-    monkeypatch.setattr("hud.server.approval_summary", lambda approval: summaries[approval.id])
+    monkeypatch.setattr("hud.server.pc_approval_preview", lambda approval: summaries[approval.id])
 
     code, headers, body = request(server, "GET", "/api/state", headers=login(server))
     assert code == 200 and headers["Content-Type"] == "application/json"
@@ -200,6 +202,48 @@ def test_approval_credentials_and_one_time_execution(hud):
     assert code == 409 and json.loads(data)["status"] == "already_decided"
     assert list(vault.rglob("*.md")) == [target]
     assert store.get_approval(approval.id).status == "done"
+
+
+@pytest.mark.parametrize("action", ["reject", "approve"])
+def test_curate_preview_requires_session_and_decision_takes_only_id(hud, action):
+    server, store, actor, vault = hud
+    proposal = build_proposal(prepare(vault), {"ops": [create(facts=["HUD_PREVIEW"])]})
+    approval = ApprovalService(store).propose("brain.curate", proposal.payload, actor, "cli")
+    path = f"/api/approvals/{approval.id}/{action}"
+    code, _, data = request(server, "GET", "/api/state")
+    assert code == 401 and b"HUD_PREVIEW" not in data
+    assert request(server, "POST", path, headers={"Origin": server.origin})[0] == 401
+    credentials = login(server)
+    def state():
+        code, _, data = request(server, "GET", "/api/state", headers=credentials)
+        assert code == 200
+        return json.loads(data)
+
+    [pending] = state()["pending"]
+    assert all(part in pending["summary"] for part in (proposal.preview, approval.id, approval.expires_at))
+    assert request(server, "POST", path, headers=credentials, body="{}")[0] == 400
+    assert not list(vault.iterdir())
+    code, _, data = request(server, "POST", path, headers=credentials)
+    assert code == 200 and json.loads(data)["status"] == ("rejected" if action == "reject" else "done")
+    assert state()["pending"] == []
+    assert len(list(vault.rglob("*.md"))) == int(action == "approve")
+
+
+def test_tampered_curate_payload_is_hidden_and_cannot_execute(hud):
+    server, store, actor, vault = hud
+    proposal = build_proposal(prepare(vault), {"ops": [create()]})
+    approval = ApprovalService(store).propose("brain.curate", proposal.payload, actor, "cli")
+    with store._connect() as db:
+        db.execute("DROP TRIGGER approvals_immutable_payload")
+        db.execute("UPDATE approvals SET payload = 'DAMAGED' WHERE id = ?", (approval.id,))
+    credentials = login(server)
+    code, _, data = request(server, "GET", "/api/state", headers=credentials)
+    assert code == 200 and b"DAMAGED" not in data
+    [pending] = json.loads(data)["pending"]
+    assert pending["id"] == approval.id and "확인할 수 없습니다" in pending["summary"]
+    path = f"/api/approvals/{approval.id}/approve"
+    assert request(server, "POST", path, headers=credentials)[0] == 403
+    assert not list(vault.iterdir())
 
 
 def test_state_is_read_only_and_exposes_only_public_fields(hud):

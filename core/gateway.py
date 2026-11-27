@@ -1,5 +1,6 @@
 """Shared request, persistence and reply formatting for channel adapters."""
 
+import hashlib
 import json
 import os
 import re
@@ -17,11 +18,13 @@ from brain.policy import Policy, Rejected, component_key
 from brain.publish import VaultRoot, pin_configured_root, search_policy
 
 from teams import LocalOnly, NoteDraft, Notice, ReplyKind, Team, TeamResult, WebAnswer, registry
-from worklog.store import Item, Record, Store
+from worklog.store import Approval, Item, Record, Store
 
 from .approval import ApprovalService, note_proposal_reply, os_user
 from .context import Context, build_context
+from .curate import build_proposal, conversation_prompt, preview, proposal_context
 from .engine import Engine, EngineResult, _REFERENCE_LINE
+from .note import approval_summary
 from .recall import recall
 from .search import search_reply
 
@@ -84,6 +87,54 @@ class _Question:
     mode: Literal["auto", "web", "private"]
 
 
+def pc_approval_preview(row: Approval) -> str:
+    if row.kind != "brain.curate" or row.status != "pending":
+        return approval_summary(row)
+    if not row.payload or hashlib.sha256(row.payload.encode()).hexdigest() != row.payload_hash:
+        return f"변경 명세를 확인할 수 없습니다.\n승인 ID {row.id}"
+    details = preview(row.payload)
+    summary = approval_summary(row)
+    if summary == "위키 정리":
+        summary = "Obsidian 어댑터 연결 불필요 (새 파일만 생성)"
+    return f"{details}\n{summary}\n만료 {row.expires_at}\n승인 ID {row.id}"
+
+
+def _curate_request(request: Request, engine: Engine, store: Store, record: Record, now: datetime) -> Reply:
+    words = request.text.split(maxsplit=1)
+    if request.channel != "cli":
+        message = "정리는 PC 전용입니다."
+    elif len(words) != 2 or words[1].startswith("/"):
+        message = "사용법: /정리 <내용>"
+    elif not callable(run_context := getattr(engine, "run_context", None)):
+        message = "도구 없는 엔진 호출을 사용할 수 없습니다."
+    else:
+        try:
+            vault = pin_configured_root()
+            prompt = conversation_prompt(words[1], vault)
+            context = proposal_context(prompt)
+            if _policy_snapshot() != (vault, prompt.catalog.policy):
+                raise Rejected("vault or policy changed")
+            result = run_context(context)
+            if result.status != "ok":
+                message = _failure(result)
+            elif len(result.items) != 1:
+                message = _FAILURES["invalid_output"]
+            else:
+                proposal = build_proposal(prompt, json.loads(result.items[0].text))
+                if json.loads(proposal.payload)["ops"]:
+                    approval = ApprovalService(store).propose("brain.curate", proposal.payload, os_user(), "cli", now)
+                    message = pc_approval_preview(approval)
+                    record = replace(record, kind="approval", reason="proposed", status="ok")
+                else:
+                    message = "추가할 변경이 없습니다."
+                    record = replace(record, status="ok")
+        except brain.Unavailable as error:
+            message = str(error)
+        except (OSError, ValueError, RecursionError):
+            message = "정리 제안을 검증할 수 없습니다."
+    return Reply(message, store.save(record), "notice")
+
+
 def _team_result(request: Request, teams: dict[str, Team]) -> TeamResult | _Question:
     body = request.text
     team = teams["/web"]
@@ -96,7 +147,7 @@ def _team_result(request: Request, teams: dict[str, Team]) -> TeamResult | _Ques
         if team is None:
             usage = " / ".join(entry.usage for entry in teams.values())
             if request.channel == "cli":
-                usage += " / /비공개 <질문>"
+                usage += " / /비공개 <질문> / /정리 <내용>"
             return Notice("사용법: " + usage)
         if team.name == "brain" and request.channel == "telegram":
             return Notice('PC에서 `javis ask "/brain …"`를 실행해 주세요.')
@@ -231,6 +282,8 @@ def handle(request: Request, store: Store, engine: Engine, now: datetime | None 
         request="", items=(), status="error", reason=None, engine=None, model=None,
         duration_s=None, ref_id=None, update_key=request.processing_key,
     )
+    if request.text.split(maxsplit=1)[:1] == ["/정리"]:
+        return _curate_request(request, engine, store, record, now)
     if request.channel == "telegram":
         words = request.text.strip().split(maxsplit=2)
         if words[:2] == ["기록", "검색"]:

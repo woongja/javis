@@ -16,7 +16,8 @@ from urllib.parse import parse_qs
 from core.approval import ApprovalService, is_interrupted
 from core.config import EngineSettings
 from core.engine import ClaudeEngine
-from core.note import approval_summary, decide_on_pc
+from core.gateway import pc_approval_preview
+from core.note import decide_on_pc
 from core.recall import question_preview
 from teams import registry
 from worklog import Approval, Store
@@ -70,7 +71,7 @@ def _pending(store: Store, actor: str) -> list[dict]:
             "kind": approval.kind,
             "status": approval.status,
             "expires_at": approval.expires_at,
-            "summary": approval_summary(approval),
+            "summary": pc_approval_preview(approval),
         })
     return previews
 
