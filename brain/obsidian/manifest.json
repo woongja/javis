@@ -1,0 +1,9 @@
+{
+  "id": "javis-adapter",
+  "name": "Javis Adapter",
+  "version": "1.0.0",
+  "minAppVersion": "1.7.2",
+  "description": "승인한 줄을 닫힌 노트 하나에 추가합니다.",
+  "author": "javis",
+  "isDesktopOnly": true
+}
